@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List
 
 import torch
@@ -19,7 +19,7 @@ from zonos2.message import (
     TTSTokenizeMsg,
     TTSUserMsg,
 )
-from zonos2.message.tts import TTSSamplingParams
+from zonos2.message.tts import TTSContinuationContext, TTSSamplingParams
 from zonos2.tts.longform import (
     build_continuation_prompt,
     context_chunks,
@@ -68,10 +68,42 @@ class _LongFormState:
     history_codes: List[List[List[int]]] = field(default_factory=list)
     raw: List[List[int]] = field(default_factory=list)
     committed: int = 0
+    prior_chunks: int = 0
+    retain_continuation: bool = False
+    valid_context: bool = True
+    max_prompt_frames: int | None = None
 
     @property
     def is_last(self) -> bool:
         return self.index == len(self.chunks) - 1
+
+    def accept_chunk(self, kept: List[List[int]], eos_frame: int | None) -> _LongFormState:
+        first = self.prior_chunks + self.index == 0
+        return replace(
+            self,
+            anchor_text=self.chunks[self.index] if first and self.pin_anchor else self.anchor_text,
+            anchor_codes=kept if first and self.pin_anchor else self.anchor_codes,
+            history_text=(
+                [*self.history_text, self.chunks[self.index]][-self.context_chunks:]
+                if self.context_chunks else []
+            ),
+            history_codes=(
+                [*self.history_codes, kept][-self.context_chunks:]
+                if self.context_chunks else []
+            ),
+            valid_context=self.valid_context and eos_frame is not None and bool(kept),
+        )
+
+    def snapshot(self) -> TTSContinuationContext | None:
+        if not self.valid_context:
+            return None
+        return TTSContinuationContext(
+            completed_chunks=self.prior_chunks + self.index + 1,
+            anchor_text=self.anchor_text,
+            anchor_codes=self.anchor_codes,
+            history_text=self.history_text,
+            history_codes=self.history_codes,
+        )
 
 
 # Extra frames trimmed off a non-final chunk to remove residual trailing silence.
@@ -186,13 +218,16 @@ def tokenize_worker(
         return t
 
     def _build_chunk_user_msg(state: _LongFormState, uid: int) -> TTSUserMsg:
-        q = state.final_quality if state.is_last else state.nonfinal_quality
+        q = (
+            state.final_quality
+            if state.is_last and not state.retain_continuation else state.nonfinal_quality
+        )
         # Whole prior chunks: the rolling recent window plus, when the anchor has
         # scrolled out of it, the pinned first chunk (middle evicted).
         prepend_anchor = (
             state.pin_anchor
             and bool(state.anchor_codes)
-            and state.index > state.context_chunks
+            and state.prior_chunks + state.index > state.context_chunks
         )
         texts = ([state.anchor_text] if prepend_anchor else []) + list(state.history_text)
         code_chunks = (
@@ -220,6 +255,22 @@ def tokenize_worker(
             # (no acoustic prefix / context text), keeping the speaker.
             if float(state.sampling_params.prefix_cfg_scale) != 1.0:
                 cfg_uncond_input_ids = _build_fresh_chunk_prompt(state, q)
+        marker_frames = (
+            int(speaker_background_num_buckets > 0)
+            + int(
+                speaker_background_num_buckets > 0
+                and accurate_mode_num_buckets > 0 and state.accurate_mode
+            )
+            if state.speaker_embedding is not None else 0
+        )
+        prompt_frames = max(
+            len(t), len(cfg_uncond_input_ids) if cfg_uncond_input_ids is not None else 0
+        )
+        if (
+            state.max_prompt_frames is not None
+            and prompt_frames + marker_frames > state.max_prompt_frames
+        ):
+            raise ValueError("Continuation prompt exceeds the model context. Use smaller chunks.")
         return TTSUserMsg(
             uid=uid,
             input_ids=t,
@@ -240,6 +291,8 @@ def tokenize_worker(
         frames, so no per-chunk cap is needed.
         """
         if not frames:
+            if finished:
+                tts_vocoder_manager.reset(uid)
             return b""
         last = len(frames) - 1
         msgs = [
@@ -285,14 +338,17 @@ def tokenize_worker(
                         else None
                     )
 
-                    if chunks is not None and len(chunks) > 1:
+                    if (
+                        msg.retain_continuation or msg.continuation_context is not None
+                        or (chunks is not None and len(chunks) > 1)
+                    ):
                         speaker_slot = (
                             tts_prompt_builder.speaker_slot()
                             if msg.speaker_embedding is not None
                             else None
                         )
                         state = _LongFormState(
-                            chunks=chunks,
+                            chunks=chunks or [text],
                             sampling_params=msg.sampling_params,
                             speaking_rate_bucket=msg.speaking_rate_bucket,
                             final_quality=msg.quality_buckets,
@@ -306,16 +362,39 @@ def tokenize_worker(
                                 msg.long_form_window_chunks
                             ),
                             pin_anchor=msg.long_form_pin_anchor,
+                            retain_continuation=msg.retain_continuation,
+                            max_prompt_frames=msg.max_prompt_frames,
                         )
+                        previous = msg.continuation_context
+                        if previous is not None:
+                            state = replace(
+                                state,
+                                prior_chunks=previous.completed_chunks,
+                                anchor_text=previous.anchor_text,
+                                anchor_codes=previous.anchor_codes,
+                                history_text=previous.history_text,
+                                history_codes=previous.history_codes,
+                            )
+                        try:
+                            first_msg = _build_chunk_user_msg(state, msg.uid)
+                        except ValueError as exc:
+                            send_frontend.put(
+                                TTSAudioReply(
+                                    uid=msg.uid, audio_data=b"", finished=True, error=str(exc)
+                                )
+                            )
+                            continue
+                        if previous is not None and previous.history_codes:
+                            tts_vocoder_manager.prime(msg.uid, previous.history_codes[-1])
                         longform_states[msg.uid] = state
                         logger.debug(
                             "Long-form uid=%d chunks=%d context=%d text='%s...'",
                             msg.uid,
-                            len(chunks),
+                            len(state.chunks),
                             state.context_chunks,
                             msg.text[:50],
                         )
-                        user_msgs.append(_build_chunk_user_msg(state, msg.uid))
+                        user_msgs.append(first_msg)
                         continue
 
                     t = tts_prompt_builder.build(
@@ -353,12 +432,11 @@ def tokenize_worker(
                             accurate_mode=msg.accurate_mode,
                         )
                     )
-                batch_output = BatchTTSBackendMsg(
-                    data=user_msgs
-                )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
-                send_backend.put(batch_output)
+                if user_msgs:
+                    batch_output = BatchTTSBackendMsg(data=user_msgs)
+                    if len(batch_output.data) == 1:
+                        batch_output = batch_output.data[0]
+                    send_backend.put(batch_output)
 
             # Process TTS detokenize (vocoder) messages
             if len(tts_detokenize_msg) > 0:
@@ -367,10 +445,11 @@ def tokenize_worker(
                 backend_submits: List[TTSUserMsg] = []
 
                 for msg in tts_detokenize_msg:
-                    state = longform_states.get(msg.uid)
-                    if state is None:
+                    current_state = longform_states.get(msg.uid)
+                    if current_state is None:
                         normal_msgs.append(msg)
                         continue
+                    state = current_state
 
                     state.raw.append(msg.audio_codes)
                     if not msg.finished:
@@ -394,38 +473,46 @@ def tokenize_worker(
                     kept = trim_chunk_codes(
                         state.raw,
                         msg.eos_frame,
-                        drop_trailing_frames=0 if is_last else _LONGFORM_BOUNDARY_TRIM,
+                        drop_trailing_frames=(
+                            0 if is_last and not state.retain_continuation
+                            else _LONGFORM_BOUNDARY_TRIM
+                        ),
                     )
                     new = kept[state.committed:] if state.committed < len(kept) else []
                     audio = _vocode(msg.uid, new, finished=is_last)
+                    state = state.accept_chunk(kept, msg.eos_frame)
                     if audio or is_last:
                         replies.append(
                             TTSAudioReply(
-                                uid=msg.uid, audio_data=audio, finished=is_last
+                                uid=msg.uid, audio_data=audio, finished=is_last,
+                                continuation_context=(
+                                    state.snapshot()
+                                    if is_last and state.retain_continuation else None
+                                ),
+                                continuation_error=(
+                                    "Generation ended without complete audio. Start a new chain or use smaller chunks."
+                                    if is_last and state.retain_continuation and not state.valid_context
+                                    else None
+                                ),
                             )
                         )
                     if is_last:
                         longform_states.pop(msg.uid, None)
                     else:
-                        # Pin the whole first chunk as the fixed anchor.
-                        if state.index == 0 and state.pin_anchor:
-                            state.anchor_text = state.chunks[0]
-                            state.anchor_codes = kept
-                        # Carry the most recent `context_chunks` whole chunks as
-                        # the rolling recent window.
-                        if state.context_chunks > 0:
-                            state.history_text.append(state.chunks[state.index])
-                            state.history_codes.append(kept)
-                            state.history_text = state.history_text[
-                                -state.context_chunks:
-                            ]
-                            state.history_codes = state.history_codes[
-                                -state.context_chunks:
-                            ]
-                        state.index += 1
-                        state.raw = []
-                        state.committed = 0
-                        backend_submits.append(_build_chunk_user_msg(state, msg.uid))
+                        state = replace(state, index=state.index + 1, raw=[], committed=0)
+                        try:
+                            next_msg = _build_chunk_user_msg(state, msg.uid)
+                        except ValueError as exc:
+                            longform_states.pop(msg.uid, None)
+                            tts_vocoder_manager.reset(msg.uid)
+                            replies.append(
+                                TTSAudioReply(
+                                    uid=msg.uid, audio_data=b"", finished=True, error=str(exc)
+                                )
+                            )
+                        else:
+                            longform_states[msg.uid] = state
+                            backend_submits.append(next_msg)
 
                 if normal_msgs:
                     audio_chunks = tts_vocoder_manager.decode_frames(normal_msgs)

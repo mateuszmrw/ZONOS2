@@ -200,6 +200,76 @@ disable it.
 
 **Response:** Raw PCM audio (`audio/pcm`, float32, 44.1 kHz, mono). Headers include `X-Audio-Sample-Rate`, `X-Audio-Channels`, `X-Audio-Format`.
 
+### Chain separate requests (Python server proof of concept)
+
+The Python server can retain audio tokens and their matching text between requests.
+The next request uses the saved first chunk and recent chunks as audio context.
+Each response contains only new audio.
+
+Run one API process with `--num-tokenizer 0` (the default).
+Send the same `X-TTS-Session-ID` header with every request in a chain.
+This client writes three responses to one PCM file:
+
+```python
+import json
+import uuid
+from urllib.request import Request, urlopen
+
+url = "http://localhost:1919/tts/generate"
+session_id = uuid.uuid4().hex
+paragraphs = ["The story begins here.", "The next paragraph follows.", "This is the ending."]
+continuation_id = None
+
+with open("chapter.pcm", "wb") as output:
+    for index, text in enumerate(paragraphs):
+        body = {
+            "text": text,
+            "stream": True,
+            "retain_continuation": index < len(paragraphs) - 1,
+        }
+        if continuation_id is None:
+            body.update(long_form=True, long_form_pin_anchor=True)
+            # Set speaker_embedding_id and other voice controls here, if needed.
+        else:
+            body["continuation_of"] = continuation_id
+        request = Request(url, data=json.dumps(body).encode(), headers={
+            "Content-Type": "application/json",
+            "X-TTS-Session-ID": session_id,
+        })
+        with urlopen(request, timeout=300) as response:
+            continuation_id = response.headers.get("X-TTS-Continuation-ID")
+            while audio := response.read(65536):
+                output.write(audio)
+```
+
+Set `retain_continuation: true` on the first request to receive `X-TTS-Continuation-ID`.
+Pass that ID as `continuation_of` on the next request.
+Read the complete response before you send the next request.
+Linked requests return a new ID unless you set `retain_continuation: false` for the final request.
+
+A linked request inherits the speaker, language, conditioning, and chunk configuration from its parent.
+Do not repeat or change those fields on linked requests.
+You can change sampling controls such as `seed`, `temperature`, and `prefix_cfg_scale`.
+The default `long_form_window_chunks: 2` retains the previous chunk alongside the pinned first chunk.
+Retained requests suppress trailing-silence conditioning and trim three boundary frames, as intermediate long-form chunks do.
+
+The cache defaults to 32 entries, 300 seconds of retention, 4096 audio frames per entry, and 16384 transcript bytes per entry.
+The frame and text limits count both the first chunk and recent chunks.
+Set `ZONOS2_CONTINUATION_MAX_ENTRIES`, `ZONOS2_CONTINUATION_TTL_SECONDS`, `ZONOS2_CONTINUATION_MAX_FRAMES`, or `ZONOS2_CONTINUATION_MAX_TEXT_BYTES` before server startup to change these limits.
+
+The cache evicts older completed entries when it fills.
+Unknown, expired, or other-session IDs return HTTP 404.
+Pending or unusable context returns HTTP 409.
+If all cache entries are pending, a new retained request returns HTTP 503.
+If generation stops before the audio is complete, that response cannot supply continuation context.
+An error after streaming starts can end the response early.
+
+This proof of concept does not persist context across server restarts or share it across API processes.
+The session header separates callers but does not authenticate them. Use a trusted local server for this version.
+Each response finishes its own audio decode. The next response uses prior decoder context without replaying its audio.
+The joins are not guaranteed to match one continuous decode sample for sample.
+Use a GPU listening test to assess voice consistency and boundary artifacts before deployment.
+
 ### `POST /v1/audio/speech`
 
 OpenAI-compatible endpoint.

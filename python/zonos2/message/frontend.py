@@ -7,6 +7,7 @@ from typing import Dict
 from .tts import (  # noqa: F401
     BatchTTSFrontendMsg,
     TTSAudioReply,
+    TTSContinuationContext,
 )
 from .utils import deserialize_type, serialize_type
 
@@ -20,4 +21,3 @@ class BaseFrontendMsg:
     @staticmethod
     def decoder(json: Dict) -> BaseFrontendMsg:
         return deserialize_type(globals(), json)
-

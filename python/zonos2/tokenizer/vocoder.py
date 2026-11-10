@@ -121,6 +121,19 @@ class TTSVocoderManager:
         # Crossfade window cache
         self._window_cache: Dict[int, np.ndarray] = {}
 
+    def prime(self, uid: int, frames: List[List[int]]) -> None:
+        """Warm a new request with prior raw frames without emitting them again.
+
+        Keep only enough left context for DAC overlap and codebook delay. Each
+        HTTP response still flushes independently, so this is not sample-exact
+        equivalence with a single continuous decode.
+        """
+        count = self.overlap_frames + self.n_codebooks
+        prefix = [list(frame) for frame in frames[-count:]]
+        self.reset(uid)
+        self._frame_buffers = {**self._frame_buffers, uid: prefix}
+        self._decoded_counts = {**self._decoded_counts, uid: len(prefix)}
+
     def decode_frames(self, msgs: List[TTSDetokenizeMsg]) -> List[bytes]:
         """Decode audio frames to PCM chunks with streaming support.
 
@@ -262,6 +275,10 @@ class TTSVocoderManager:
                     (1.0 - fade_in) * prev_tail[-overlap_samples:]
                     + fade_in * audio_np[:overlap_samples]
                 )
+        elif overlap > 0:
+            # A primed request re-decodes left context but has no pending tail
+            # from the previous response. Never replay those prefix samples.
+            audio_np = audio_np[overlap * self.hop_length:]
 
         # --- Withhold tail for next chunk's crossfade (unless final) ---
         if not is_final and self.overlap_frames > 0:

@@ -63,6 +63,17 @@ class BatchTTSTokenizerMsg(BaseTTSTokenizerMsg):
 
 
 @dataclass
+class TTSContinuationContext:
+    """Whole accepted audio chunks and matching text retained between HTTP requests."""
+
+    completed_chunks: int
+    anchor_text: str
+    anchor_codes: List[List[int]]
+    history_text: List[str]
+    history_codes: List[List[List[int]]]
+
+
+@dataclass
 class TTSTokenizeMsg(BaseTTSTokenizerMsg):
     """Request to build TTS prompt frames from text (Frontend -> Tokenizer)."""
 
@@ -109,6 +120,11 @@ class TTSTokenizeMsg(BaseTTSTokenizerMsg):
     # How to split text into chunks: "word" (greedy word packing) or "sentence"
     # (pack whole sentences, falling back to words for over-long sentences).
     long_form_split_mode: str = "word"
+    retain_continuation: bool = False
+    continuation_context: TTSContinuationContext | None = None
+    # The tokenizer rejects an oversized continuation instead of letting the
+    # scheduler silently drop it. Leave room for at least one generated frame.
+    max_prompt_frames: int | None = None
 
 
 @dataclass
@@ -203,3 +219,6 @@ class TTSAudioReply(BaseTTSFrontendMsg):
     audio_data: bytes  # PCM audio chunk (float32, 44.1kHz)
     finished: bool
     sample_rate: int = 44100
+    continuation_context: TTSContinuationContext | None = None
+    continuation_error: str | None = None
+    error: str | None = None

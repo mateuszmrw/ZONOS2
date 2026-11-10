@@ -9,9 +9,9 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Tuple
 
 import numpy as np
 import torch
@@ -55,13 +55,17 @@ from zonos2.tts.emotion import (
 from zonos2.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 
 from .args import ServerArgs
+from .continuation import ContinuationCache, ContinuationCacheConfig, ContinuationUnavailable
+
+if TYPE_CHECKING:
+    from zonos2.models.speaker_cloning import Qwen3SpeakerEmbedding
 
 _UI_HTML = Path(__file__).resolve().parent.parent.parent.parent / "tts_ui.html"
 
 logger = init_logger(__name__, "FrontendAPI")
 
-_GLOBAL_STATE = None
-_SPEAKER_EMBEDDERS = {}
+_GLOBAL_STATE: FrontendManager | None = None
+_SPEAKER_EMBEDDERS: Dict[str, Qwen3SpeakerEmbedding] = {}
 _SPEAKER_EMBEDDER_LOCK = asyncio.Lock()
 _SPEAKER_EMBEDDER_DEVICE = os.getenv("ZONOS2_SPEAKER_EMBEDDER_DEVICE", "cpu")
 _SESSION_SPEAKER_CACHE: Dict[str, Dict[str, "CachedSpeakerReference"]] = {}
@@ -141,7 +145,7 @@ def _field_was_set(model: BaseModel, field_name: str) -> bool:
     fields_set = getattr(model, "model_fields_set", None)
     if fields_set is None:
         fields_set = getattr(model, "__fields_set__", set())
-    return field_name in fields_set
+    return field_name in (fields_set or set())
 
 
 def _normalize_tts_request_language(language: str) -> str:
@@ -866,6 +870,10 @@ class TTSGenerateRequest(BaseModel):
     """Request model for TTS generation."""
 
     text: str
+    # Opt in on the first request; continuation_of implicitly retains the next
+    # context unless retain_continuation is explicitly false (the final request).
+    retain_continuation: bool = False
+    continuation_of: str | None = Field(default=None, min_length=1, max_length=128)
     language: str = "en_us"
     text_normalization: bool = True
     temperature: float = 1.15
@@ -987,6 +995,9 @@ class FrontendManager:
     ack_map: Dict[int, List[TTSAudioReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
     start_time_map: Dict[int, float] = field(default_factory=dict)
+    continuations: ContinuationCache = field(
+        default_factory=lambda: ContinuationCache(ContinuationCacheConfig.from_env())
+    )
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -1003,6 +1014,10 @@ class FrontendManager:
                 if msg.uid not in self.ack_map:
                     # Replies can keep arriving after a client abort; drop them.
                     continue
+                if msg.finished:
+                    self.continuations.complete(
+                        msg.uid, msg.continuation_context, msg.error or msg.continuation_error
+                    )
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
 
@@ -1014,6 +1029,13 @@ class FrontendManager:
     async def send_one(self, msg: BaseTokenizerMsg):
         self._create_listener_once()
         await self.send_tokenizer.put(msg)
+
+    async def wait_for_tts_start(self, uid: int) -> None:
+        """Check the first reply before opening a continuation HTTP stream."""
+        await self.event_map[uid].wait()
+        error = next((ack.error for ack in self.ack_map[uid] if ack.error), None)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
@@ -1029,6 +1051,11 @@ class FrontendManager:
             self.ack_map[uid] = []
             ack = None
             for ack in pending:
+                if ack.finished:
+                    self.ack_map.pop(uid, None)
+                    self.event_map.pop(uid, None)
+                if ack.error:
+                    raise HTTPException(status_code=400, detail=ack.error)
                 yield ack
             if ack and ack.finished:
                 break
@@ -1037,6 +1064,7 @@ class FrontendManager:
         self.event_map.pop(uid, None)
 
     async def abort_user(self, uid: int):
+        self.continuations.abort(uid)
         await asyncio.sleep(0.1)
         if uid in self.ack_map:
             del self.ack_map[uid]
@@ -1130,6 +1158,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-TTS-Continuation-ID"],
 )
 
 
@@ -1243,6 +1272,51 @@ async def create_speech(
     )
 
 
+async def _submit_tts_generation(
+    state: FrontendManager,
+    msg: TTSTokenizeMsg,
+    req: TTSGenerateRequest,
+    session_id: str | None,
+) -> Response:
+    headers = {
+        "X-Audio-Sample-Rate": "44100",
+        "X-Audio-Channels": "1",
+        "X-Audio-Format": "float32",
+    }
+    try:
+        if msg.retain_continuation:
+            assert session_id is not None
+            headers = {
+                **headers,
+                "X-TTS-Continuation-ID": state.continuations.reserve(session_id, msg),
+            }
+        await state.send_one(msg)
+        if msg.retain_continuation or msg.continuation_context is not None:
+            await state.wait_for_tts_start(msg.uid)
+    except ContinuationUnavailable as exc:
+        await state.abort_user(msg.uid)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except BaseException:
+        await state.abort_user(msg.uid)
+        raise
+
+    if req.stream:
+
+        async def audio_stream():
+            try:
+                async for audio in state.stream_tts_audio(msg.uid, fade_out_ms=req.fade_out_ms):
+                    yield audio
+            finally:
+                await state.abort_user(msg.uid)
+
+        return StreamingResponse(audio_stream(), media_type="audio/pcm", headers=headers)
+    try:
+        audio_data = await state.wait_for_tts_audio(msg.uid, fade_out_ms=req.fade_out_ms)
+        return Response(content=audio_data, media_type="audio/pcm", headers=headers)
+    finally:
+        await state.abort_user(msg.uid)
+
+
 @app.post("/tts/generate")
 async def tts_generate(
     req: TTSGenerateRequest,
@@ -1251,6 +1325,58 @@ async def tts_generate(
     """Simple TTS generation endpoint."""
     logger.debug("Received TTS generate request: %s", req.text[:50])
     state = get_global_state()
+    session_id = _normalize_session_id(x_tts_session_id)
+    if req.retain_continuation or req.continuation_of is not None:
+        if not session_id:
+            raise HTTPException(
+                status_code=400, detail="Continuation requires the X-TTS-Session-ID header."
+            )
+        if state.config.num_tokenizer != 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Continuation PoC requires --num-tokenizer 0 (shared tokenizer).",
+            )
+        if not req.text.strip():
+            raise HTTPException(status_code=400, detail="Continuation text must not be empty.")
+    if req.continuation_of is not None:
+        assert session_id is not None
+        try:
+            parent = state.continuations.get(req.continuation_of, session_id)
+        except ContinuationUnavailable as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        supplied = req.model_dump(exclude_unset=True)
+        sampling_fields = set(TTSSamplingParams.__dataclass_fields__) & set(supplied)
+        allowed = sampling_fields | {
+            "text", "stream", "continuation_of", "retain_continuation", "fade_out_ms"
+        }
+        unsupported = set(supplied) - allowed
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Continuation inherits voice, language, conditioning, and chunk configuration. "
+                    f"Remove these overrides: {', '.join(sorted(unsupported))}."
+                ),
+            )
+        sampling_updates = {name: supplied[name] for name in sampling_fields}
+        if "max_tokens" in sampling_updates:
+            try:
+                sampling_updates = {
+                    **sampling_updates,
+                    "max_tokens": _resolve_tts_max_tokens(state.config, req.max_tokens),
+                }
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        uid = state.new_user()
+        msg = replace(
+            parent,
+            uid=uid,
+            text=req.text,
+            sampling_params=replace(parent.sampling_params, **sampling_updates),
+            retain_continuation=req.retain_continuation if "retain_continuation" in supplied else True,
+            max_prompt_frames=state.config.max_seq_len - 1,
+        )
+        return await _submit_tts_generation(state, msg, req, session_id)
     try:
         speaker_embedding = await _resolve_speaker_embedding(
             config=state.config,
@@ -1299,66 +1425,40 @@ async def tts_generate(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     uid = state.new_user()
 
-    await state.send_one(
-        TTSTokenizeMsg(
-            uid=uid,
-            text=req.text,
-            language=language,
-            text_normalization=req.text_normalization,
-            sampling_params=TTSSamplingParams(
-                temperature=req.temperature,
-                topk=req.topk,
-                top_p=req.top_p,
-                min_p=req.min_p,
-                max_tokens=max_tokens,
-                repetition_window=req.repetition_window,
-                repetition_penalty=req.repetition_penalty,
-                repetition_codebooks=req.repetition_codebooks,
-                seed=req.seed,
-                emotion_cfg_scale=req.emotion_cfg_scale,
-                cfg_scale=req.cfg_scale,
-                prefix_cfg_scale=req.prefix_cfg_scale,
-            ),
-            speaker_embedding=speaker_embedding,
-            speaker_emotion_delta=speaker_emotion_delta,
-            clean_speaker_background=req.clean_speaker_background,
-            accurate_mode=req.accurate_mode,
-            speaking_rate_bucket=speaking_rate_bucket,
-            quality_buckets=quality_buckets,
-            long_form=req.long_form,
-            long_form_chunk_chars=req.long_form_chunk_chars,
-            long_form_window_chunks=req.long_form_window_chunks,
-            long_form_pin_anchor=req.long_form_pin_anchor,
-            long_form_split_mode=req.long_form_split_mode,
-        )
+    msg = TTSTokenizeMsg(
+        uid=uid,
+        text=req.text,
+        language=language,
+        text_normalization=req.text_normalization,
+        sampling_params=TTSSamplingParams(
+            temperature=req.temperature,
+            topk=req.topk,
+            top_p=req.top_p,
+            min_p=req.min_p,
+            max_tokens=max_tokens,
+            repetition_window=req.repetition_window,
+            repetition_penalty=req.repetition_penalty,
+            repetition_codebooks=req.repetition_codebooks,
+            seed=req.seed,
+            emotion_cfg_scale=req.emotion_cfg_scale,
+            cfg_scale=req.cfg_scale,
+            prefix_cfg_scale=req.prefix_cfg_scale,
+        ),
+        speaker_embedding=speaker_embedding,
+        speaker_emotion_delta=speaker_emotion_delta,
+        clean_speaker_background=req.clean_speaker_background,
+        accurate_mode=req.accurate_mode,
+        speaking_rate_bucket=speaking_rate_bucket,
+        quality_buckets=quality_buckets,
+        long_form=req.long_form,
+        long_form_chunk_chars=req.long_form_chunk_chars,
+        long_form_window_chunks=req.long_form_window_chunks,
+        long_form_pin_anchor=req.long_form_pin_anchor,
+        long_form_split_mode=req.long_form_split_mode,
+        retain_continuation=req.retain_continuation,
+        max_prompt_frames=state.config.max_seq_len - 1 if req.retain_continuation else None,
     )
-
-    async def _abort():
-        await state.abort_user(uid)
-
-    if req.stream:
-        return StreamingResponse(
-            state.stream_tts_audio(uid, fade_out_ms=req.fade_out_ms),
-            media_type="audio/pcm",
-            headers={
-                "X-Audio-Sample-Rate": "44100",
-                "X-Audio-Channels": "1",
-                "X-Audio-Format": "float32",
-            },
-            background=BackgroundTask(_abort),
-        )
-    else:
-        # Collect full audio then return
-        audio_data = await state.wait_for_tts_audio(uid, fade_out_ms=req.fade_out_ms)
-        return Response(
-            content=audio_data,
-            media_type="audio/pcm",
-            headers={
-                "X-Audio-Sample-Rate": "44100",
-                "X-Audio-Channels": "1",
-                "X-Audio-Format": "float32",
-            },
-        )
+    return await _submit_tts_generation(state, msg, req, session_id)
 
 
 @app.post("/tts/speakers")
@@ -1407,6 +1507,7 @@ async def tts_cache_speaker(
             )
         else:
             embedding_name = req.speaker_embedding_name
+            assert req.speaker_embedding_base64 is not None
             embedding = _compute_speaker_embedding_from_file(
                 req.speaker_embedding_base64,
                 expected_dim=expected_dim,
