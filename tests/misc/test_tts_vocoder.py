@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import numpy as np
+import pytest
 import torch
 from zonos2.message import TTSDetokenizeMsg
 from zonos2.tokenizer import vocoder
 
 
-def test_vocoder_does_not_send_eos_frame_or_after_to_dac(monkeypatch):
+def test_vocoder_does_not_send_eos_frame_or_after_to_dac(monkeypatch: pytest.MonkeyPatch) -> None:
     captured_codes: list[torch.Tensor] = []
 
     def fake_decode_dac(codes: torch.Tensor) -> torch.Tensor:
@@ -45,3 +47,31 @@ def test_vocoder_does_not_send_eos_frame_or_after_to_dac(monkeypatch):
             [11, 22, 33],
         ]
     ]
+
+
+def test_primed_vocoder_flushes_only_new_samples_across_all_codebooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Give each raw row and codebook a distinct value; reducing CB0 alone
+    # would miss incorrect delayed-codebook alignment at the end of a response.
+    def fake_decode_dac(codes: torch.Tensor) -> torch.Tensor:
+        return codes.sum(dim=-1, dtype=torch.float32).cpu()
+
+    monkeypatch.setattr(vocoder, "decode_dac", fake_decode_dac)
+    manager = vocoder.TTSVocoderManager(
+        n_codebooks=9, min_decode_chunk=16, overlap_frames=4, hop_length=1
+    )
+    uid = 1
+    prefix = [[row * 9 + cb for cb in range(9)] for row in range(20)]
+    generated = [[200 + row * 9 + cb for cb in range(9)] for row in range(42)]
+    manager.prime(uid, prefix)
+    chunks = manager.decode_frames(
+        [TTSDetokenizeMsg(uid=uid, audio_codes=row, finished=False) for row in generated]
+    )
+    pcm = np.frombuffer(b"".join(chunks) + manager.finish(uid), dtype=np.float32)
+    expected = [
+        sum(generated[row + cb][cb] if row + cb < len(generated) else 1025 for cb in range(9))
+        for row in range(len(generated))
+    ]
+    np.testing.assert_allclose(pcm, expected, rtol=0, atol=0.001)
+    assert manager.finish(uid) == b""

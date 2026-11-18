@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from zonos2.attention import BaseAttnBackend, BaseAttnMetadata
     from zonos2.kvcache import BaseCacheHandle
+    from zonos2.message.tts import TTSFinishReason
 
 
 @dataclass
@@ -164,6 +165,17 @@ class TTSReq:
 
     def can_decode(self) -> bool:
         return self.remain_len > 0 and self.eos_countdown != 0
+
+    def update_finish_reason(
+        self, audio_codes: List[int], max_seq_len: int
+    ) -> TTSFinishReason | None:
+        # EOS wins if its countdown finishes on the exact frame limit. Seeing EOS
+        # without the rest of the delayed codebooks does not complete the chunk.
+        if self.check_eos(audio_codes):
+            return "complete"
+        if self.remain_len <= 0 or self.device_len >= max_seq_len - 1:
+            return "frame_limit"
+        return None
 
     def check_eos(self, audio_codes: List[int]) -> bool:
         """Check for EOS and update countdown state.

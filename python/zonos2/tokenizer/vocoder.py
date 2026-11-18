@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Dict, List
 
 import numpy as np
@@ -134,7 +135,12 @@ class TTSVocoderManager:
         self._frame_buffers = {**self._frame_buffers, uid: prefix}
         self._decoded_counts = {**self._decoded_counts, uid: len(prefix)}
 
-    def decode_frames(self, msgs: List[TTSDetokenizeMsg]) -> List[bytes]:
+    def decode_frames(
+        self,
+        msgs: List[TTSDetokenizeMsg],
+        *,
+        final_lookahead: Sequence[Sequence[int]] = (),
+    ) -> List[bytes]:
         """Decode audio frames to PCM chunks with streaming support.
 
         Accumulates frames and decodes incrementally when enough context is
@@ -148,12 +154,16 @@ class TTSVocoderManager:
 
         Args:
             msgs: List of TTS detokenize messages
+            final_lookahead: Extra raw rows after the last message, which must
+                finish a request. Used for alignment, not as output frames.
 
         Returns:
             List of PCM audio bytes (float32, 44.1kHz), one per message
         """
+        if final_lookahead and (not msgs or not msgs[-1].finished):
+            raise ValueError("Final lookahead requires a finished last message.")
         results = []
-        for msg in msgs:
+        for i, msg in enumerate(msgs):
             uid = msg.uid
 
             # Initialize state if needed
@@ -166,7 +176,12 @@ class TTSVocoderManager:
             # Accumulate frame
             self._frame_buffers[uid].append(msg.audio_codes)
 
-            # Calculate how many complete frames we can decode
+            if msg.finished:
+                lookahead = final_lookahead if i == len(msgs) - 1 else ()
+                results.append(self.finish(uid, lookahead=lookahead))
+                continue
+
+            # Calculate how many complete frames we can decode before the final flush.
             total = len(self._frame_buffers[uid])
             # With N frames, can decode output frames 0 to N-(n_codebooks-1)-1
             complete_frames = total - (self.n_codebooks - 1)
@@ -174,32 +189,21 @@ class TTSVocoderManager:
                 complete_frames = min(complete_frames, self._eos_frames[uid])
             new_decodable = complete_frames - self._decoded_counts[uid]
 
-            should_decode = False
-            if msg.finished:
-                # End of stream: decode everything before EOS, then flush any
-                # withheld overlap tail from the last non-final chunk.
-                should_decode = (
-                    complete_frames > self._decoded_counts[uid]
-                    or uid in self._overlap_tails
-                )
-            elif new_decodable >= self.min_decode_chunk:
-                # Streaming: batch decode when we have enough new frames
-                should_decode = True
-
-            if should_decode:
-                audio = self._decode_incremental(uid, msg.finished)
-                results.append(audio)
+            if new_decodable >= self.min_decode_chunk:
+                results.append(self._decode_incremental(uid, is_final=False))
             else:
                 results.append(b"")
 
-            # Cleanup finished requests
-            if msg.finished:
-                self._frame_buffers.pop(uid, None)
-                self._decoded_counts.pop(uid, None)
-                self._eos_frames.pop(uid, None)
-                self._overlap_tails.pop(uid, None)
-
         return results
+
+    def finish(self, uid: int, *, lookahead: Sequence[Sequence[int]] = ()) -> bytes:
+        """Flush the buffer with optional alignment rows, then release it."""
+        if uid not in self._frame_buffers:
+            return b""
+        try:
+            return self._decode_incremental(uid, is_final=True, lookahead=lookahead)
+        finally:
+            self.reset(uid)
 
     def _get_crossfade_window(self, length: int) -> np.ndarray:
         """Get a cached raised-cosine fade-in window of the given sample length."""
@@ -209,7 +213,9 @@ class TTSVocoderManager:
             ).astype(np.float32)
         return self._window_cache[length]
 
-    def _decode_incremental(self, uid: int, is_final: bool) -> bytes:
+    def _decode_incremental(
+        self, uid: int, is_final: bool, *, lookahead: Sequence[Sequence[int]] = ()
+    ) -> bytes:
         """Decode new frames incrementally with OLA crossfading.
 
         Re-decodes ``overlap_frames`` previously-decoded frames together with
@@ -224,6 +230,7 @@ class TTSVocoderManager:
         Args:
             uid: Request user ID
             is_final: Whether this is the final decode (end of stream)
+            lookahead: Raw rows used to align delayed codes at the end only.
 
         Returns:
             PCM audio bytes (float32)
@@ -249,8 +256,10 @@ class TTSVocoderManager:
 
         # --- Raw slice including overlap context for shear_up ---
         decode_start = decoded - overlap
-        raw_end = min(target_frames + self.n_codebooks - 1, total)
-        raw_slice = buffer[decode_start:raw_end]
+        raw_end = target_frames + self.n_codebooks - 1
+        raw_slice: Sequence[Sequence[int]] = buffer[decode_start:raw_end]
+        if raw_end > total and lookahead:
+            raw_slice = [*raw_slice, *lookahead[:raw_end - total]]
 
         # --- shear_up and take output frames ---
         device = "cuda" if torch.cuda.is_available() else "cpu"

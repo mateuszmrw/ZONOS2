@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import List
 
@@ -19,7 +20,7 @@ from zonos2.message import (
     TTSTokenizeMsg,
     TTSUserMsg,
 )
-from zonos2.message.tts import TTSContinuationContext, TTSSamplingParams
+from zonos2.message.tts import TTSContinuationContext, TTSFinishReason, TTSSamplingParams
 from zonos2.tts.longform import (
     build_continuation_prompt,
     context_chunks,
@@ -70,14 +71,13 @@ class _LongFormState:
     committed: int = 0
     prior_chunks: int = 0
     retain_continuation: bool = False
-    valid_context: bool = True
     max_prompt_frames: int | None = None
 
     @property
     def is_last(self) -> bool:
         return self.index == len(self.chunks) - 1
 
-    def accept_chunk(self, kept: List[List[int]], eos_frame: int | None) -> _LongFormState:
+    def accept_chunk(self, kept: List[List[int]]) -> _LongFormState:
         first = self.prior_chunks + self.index == 0
         return replace(
             self,
@@ -91,12 +91,9 @@ class _LongFormState:
                 [*self.history_codes, kept][-self.context_chunks:]
                 if self.context_chunks else []
             ),
-            valid_context=self.valid_context and eos_frame is not None and bool(kept),
         )
 
-    def snapshot(self) -> TTSContinuationContext | None:
-        if not self.valid_context:
-            return None
+    def snapshot(self) -> TTSContinuationContext:
         return TTSContinuationContext(
             completed_chunks=self.prior_chunks + self.index + 1,
             anchor_text=self.anchor_text,
@@ -283,17 +280,13 @@ def tokenize_worker(
             cfg_uncond_input_ids=cfg_uncond_input_ids,
         )
 
-    def _vocode(uid: int, frames: List[List[int]], finished: bool) -> bytes:
-        """Feed content frames into the continuous per-uid vocoder buffer.
-
-        Only the final frame of the whole request carries finished=True (which
-        flushes the buffer). eos_frame is never set: we only ever feed content
-        frames, so no per-chunk cap is needed.
-        """
+    def _vocode(
+        uid: int, frames: List[List[int]], finished: bool, *,
+        final_lookahead: Sequence[Sequence[int]] = (),
+    ) -> bytes:
+        """Feed content frames into the vocoder and flush at request end."""
         if not frames:
-            if finished:
-                tts_vocoder_manager.reset(uid)
-            return b""
+            return tts_vocoder_manager.finish(uid, lookahead=final_lookahead) if finished else b""
         last = len(frames) - 1
         msgs = [
             TTSDetokenizeMsg(
@@ -301,7 +294,9 @@ def tokenize_worker(
             )
             for i, f in enumerate(frames)
         ]
-        return b"".join(tts_vocoder_manager.decode_frames(msgs))
+        return b"".join(
+            tts_vocoder_manager.decode_frames(msgs, final_lookahead=final_lookahead)
+        )
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
@@ -469,31 +464,47 @@ def tokenize_worker(
                         continue
 
                     # Chunk finished: trim to content, feed the remainder.
-                    is_last = state.is_last
+                    complete = msg.finish_reason == "complete" and msg.eos_frame is not None
                     kept = trim_chunk_codes(
                         state.raw,
                         msg.eos_frame,
                         drop_trailing_frames=(
-                            0 if is_last and not state.retain_continuation
-                            else _LONGFORM_BOUNDARY_TRIM
+                            _LONGFORM_BOUNDARY_TRIM
+                            if complete and (not state.is_last or state.retain_continuation)
+                            else 0
                         ),
                     )
+                    usable = complete and bool(kept)
+                    # Never synthesize the next chunk with a whole transcript for
+                    # unfinished or empty audio. Flush this request's partial PCM.
+                    is_last = state.is_last or not usable
+                    finish_reason: TTSFinishReason | None = msg.finish_reason if is_last else None
+                    if is_last and not usable and finish_reason != "frame_limit":
+                        finish_reason = "failed"
                     new = kept[state.committed:] if state.committed < len(kept) else []
-                    audio = _vocode(msg.uid, new, finished=is_last)
-                    state = state.accept_chunk(kept, msg.eos_frame)
+                    # The final content frame still needs later rows to align its
+                    # delayed codebooks. Do not play or retain those rows.
+                    lookahead = (
+                        state.raw[len(kept):len(kept) + n_codebooks - 1]
+                        if is_last and usable else []
+                    )
+                    audio = _vocode(msg.uid, new, finished=is_last, final_lookahead=lookahead)
+                    if usable:
+                        state = state.accept_chunk(kept)
                     if audio or is_last:
                         replies.append(
                             TTSAudioReply(
                                 uid=msg.uid, audio_data=audio, finished=is_last,
                                 continuation_context=(
                                     state.snapshot()
-                                    if is_last and state.retain_continuation else None
+                                    if is_last and usable and state.retain_continuation else None
                                 ),
                                 continuation_error=(
                                     "Generation ended without complete audio. Start a new chain or use smaller chunks."
-                                    if is_last and state.retain_continuation and not state.valid_context
+                                    if is_last and state.retain_continuation and not usable
                                     else None
                                 ),
+                                finish_reason=finish_reason,
                             )
                         )
                     if is_last:
@@ -519,7 +530,8 @@ def tokenize_worker(
                     for m, audio in zip(normal_msgs, audio_chunks, strict=True):
                         replies.append(
                             TTSAudioReply(
-                                uid=m.uid, audio_data=audio, finished=m.finished
+                                uid=m.uid, audio_data=audio, finished=m.finished,
+                                finish_reason=m.finish_reason,
                             )
                         )
 

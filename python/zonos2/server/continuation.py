@@ -6,10 +6,10 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
-from zonos2.message.tts import TTSContinuationContext, TTSTokenizeMsg
+from zonos2.message.tts import TTSContinuationContext, TTSFinishReason, TTSTokenizeMsg
 
 
 class ContinuationCacheConfig(BaseModel):
@@ -35,6 +35,13 @@ class ContinuationUnavailable(ValueError):
         self.status_code = status_code
 
 
+class ContinuationStatus(BaseModel):
+    status: Literal["pending", "complete", "incomplete", "failed"]
+    usable: bool
+    finish_reason: TTSFinishReason | None
+    error: str | None = None
+
+
 @dataclass(frozen=True)
 class _Entry:
     owner: str
@@ -42,6 +49,7 @@ class _Entry:
     expires_at: float
     context: TTSContinuationContext | None = None
     error: str | None = None
+    finish_reason: TTSFinishReason | None = None
 
 
 class ContinuationCache:
@@ -84,11 +92,31 @@ class ContinuationCache:
         }
         return key
 
-    def get(self, key: str, owner: str) -> TTSTokenizeMsg:
+    def _lookup(self, key: str, owner: str) -> _Entry:
         self._prune()
         entry = self._entries.get(key)
         if entry is None or entry.owner != owner:
             raise ContinuationUnavailable("Continuation ID was not found or expired.")
+        return entry
+
+    def status(self, key: str, owner: str) -> ContinuationStatus:
+        entry = self._lookup(key, owner)
+        usable = entry.context is not None
+        status: Literal["pending", "complete", "incomplete", "failed"]
+        if usable:
+            status = "complete"
+        elif entry.finish_reason is None:
+            status = "pending"
+        elif entry.finish_reason == "failed":
+            status = "failed"
+        else:
+            status = "incomplete"
+        return ContinuationStatus(
+            status=status, usable=usable, finish_reason=entry.finish_reason, error=entry.error
+        )
+
+    def get(self, key: str, owner: str) -> TTSTokenizeMsg:
+        entry = self._lookup(key, owner)
         if entry.error:
             raise ContinuationUnavailable(entry.error, 409)
         if entry.context is None:
@@ -102,8 +130,12 @@ class ContinuationCache:
         uid: int,
         context: TTSContinuationContext | None,
         error: str | None = None,
+        *,
+        finish_reason: TTSFinishReason,
     ) -> None:
         self._prune()
+        if finish_reason != "complete" or error is not None:
+            context = None
         if context is not None:
             frames = len(context.anchor_codes) + sum(map(len, context.history_codes))
             text_bytes = len(context.anchor_text.encode("utf-8")) + sum(
@@ -112,15 +144,20 @@ class ContinuationCache:
             if frames > self.config.max_frames or text_bytes > self.config.max_text_bytes:
                 context = None
                 error = "Continuation context exceeds the cache limit. Use smaller chunks."
+        if context is None and error is None:
+            error = "No usable continuation context."
         self._entries = {
-            key: replace(
-                entry,
-                context=context,
-                error=error if context is not None else (error or "No usable continuation context."),
-                expires_at=self._clock() + self.config.ttl_seconds,
+            key: (
+                replace(
+                    entry,
+                    context=context,
+                    error=error,
+                    finish_reason=finish_reason,
+                    expires_at=self._clock() + self.config.ttl_seconds,
+                )
+                if entry.template.uid == uid
+                else entry
             )
-            if entry.template.uid == uid
-            else entry
             for key, entry in self._entries.items()
         }
 

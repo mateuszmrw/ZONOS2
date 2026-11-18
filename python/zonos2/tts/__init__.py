@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .llm import TTSLLM
+from typing import TYPE_CHECKING
+
 from .prompt import (
     BYTE_TEXT_VOCAB_SIZE,
     TTSPromptBuilder,
@@ -16,6 +17,19 @@ from .prompt import (
     tokens_to_prompt_tokens,
 )
 from .sequence import TTSSequence
+
+if TYPE_CHECKING:
+    from .llm import TTSLLM
+
+
+def __getattr__(name: str) -> type[TTSLLM]:
+    # Prompt-only and server-side CPU utilities do not need the CUDA inference stack.
+    if name == "TTSLLM":
+        from .llm import TTSLLM
+
+        return TTSLLM
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "BYTE_TEXT_VOCAB_SIZE",

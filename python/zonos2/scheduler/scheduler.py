@@ -279,10 +279,9 @@ class TTSScheduler(SchedulerIOMixin):
             if generated <= 5:
                 logger.debug("TTS %d frame %d: audio_codes=%s", req.uid, generated, audio_codes)
 
-            # Check for EOS
-            finished = req.remain_len <= 0
-            if req.check_eos(audio_codes):
-                finished = True
+            finish_reason = req.update_finish_reason(audio_codes, max_seq_len)
+            finished = finish_reason is not None
+            if finish_reason == "complete":
                 logger.debug(
                     "TTS %d EOS detected at frame %d, eos_frame=%d",
                     req.uid,
@@ -290,8 +289,7 @@ class TTSScheduler(SchedulerIOMixin):
                     req.eos_frame,
                 )
 
-            if req.device_len >= max_seq_len - 1:
-                finished = True
+            elif finish_reason == "frame_limit" and req.device_len >= max_seq_len - 1:
                 logger.warning_rank0(f"TTS request {req.uid} reached {max_seq_len = }, dropped.")
 
             # Send detokenize message with audio codes
@@ -301,6 +299,7 @@ class TTSScheduler(SchedulerIOMixin):
                     audio_codes=audio_codes,
                     finished=finished,
                     eos_frame=req.eos_frame if req.eos_frame >= 0 else None,
+                    finish_reason=finish_reason,
                 )
             )
 

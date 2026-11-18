@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Literal, cast
 
 import torch
 
 from .utils import deserialize_type, serialize_type
+
+TTSFinishReason = Literal["complete", "frame_limit", "failed"]
 
 
 @dataclass
@@ -52,7 +54,7 @@ class BaseTTSTokenizerMsg:
 
     @staticmethod
     def decoder(json: Dict) -> BaseTTSTokenizerMsg:
-        return deserialize_type(globals(), json)
+        return cast(BaseTTSTokenizerMsg, deserialize_type(globals(), json))
 
 
 @dataclass
@@ -138,6 +140,7 @@ class TTSDetokenizeMsg(BaseTTSTokenizerMsg):
     audio_codes: List[int]  # [cb0, cb1, ..., cb8] for one frame
     finished: bool
     eos_frame: int | None = None
+    finish_reason: TTSFinishReason | None = None  # only set on the terminal frame
 
 
 @dataclass
@@ -149,7 +152,7 @@ class BaseTTSBackendMsg:
 
     @staticmethod
     def decoder(json: Dict) -> BaseTTSBackendMsg:
-        return deserialize_type(globals(), json)
+        return cast(BaseTTSBackendMsg, deserialize_type(globals(), json))
 
 
 @dataclass
@@ -198,7 +201,7 @@ class BaseTTSFrontendMsg:
 
     @staticmethod
     def decoder(json: Dict) -> BaseTTSFrontendMsg:
-        return deserialize_type(globals(), json)
+        return cast(BaseTTSFrontendMsg, deserialize_type(globals(), json))
 
 
 @dataclass
@@ -222,3 +225,4 @@ class TTSAudioReply(BaseTTSFrontendMsg):
     continuation_context: TTSContinuationContext | None = None
     continuation_error: str | None = None
     error: str | None = None
+    finish_reason: TTSFinishReason | None = None  # whole HTTP request, not an intermediate chunk

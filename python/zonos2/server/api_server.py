@@ -20,7 +20,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 from zonos2.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
@@ -29,6 +29,7 @@ from zonos2.message import (
     TTSSamplingParams,
     TTSTokenizeMsg,
 )
+from zonos2.message.tts import TTSFinishReason
 from zonos2.tts.audio import (
     _decode_audio_bytes,
     _decode_wav_bytes,
@@ -54,11 +55,17 @@ from zonos2.tts.emotion import (
 )
 from zonos2.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 
-from .args import ServerArgs
-from .continuation import ContinuationCache, ContinuationCacheConfig, ContinuationUnavailable
+from .continuation import (
+    ContinuationCache,
+    ContinuationCacheConfig,
+    ContinuationStatus,
+    ContinuationUnavailable,
+)
 
 if TYPE_CHECKING:
     from zonos2.models.speaker_cloning import Qwen3SpeakerEmbedding
+
+    from .args import ServerArgs
 
 _UI_HTML = Path(__file__).resolve().parent.parent.parent.parent / "tts_ui.html"
 
@@ -1016,7 +1023,8 @@ class FrontendManager:
                     continue
                 if msg.finished:
                     self.continuations.complete(
-                        msg.uid, msg.continuation_context, msg.error or msg.continuation_error
+                        msg.uid, msg.continuation_context, msg.error or msg.continuation_error,
+                        finish_reason=msg.finish_reason or "failed",
                     )
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
@@ -1063,15 +1071,11 @@ class FrontendManager:
         self.ack_map.pop(uid, None)
         self.event_map.pop(uid, None)
 
-    async def abort_user(self, uid: int):
+    def abort_user(self, uid: int) -> None:
         self.continuations.abort(uid)
-        await asyncio.sleep(0.1)
-        if uid in self.ack_map:
-            del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
+        self.ack_map.pop(uid, None)
+        self.event_map.pop(uid, None)
         self.start_time_map.pop(uid, None)
-        logger.warning("Aborting request for user %s", uid)
 
     async def stream_tts_audio(self, uid: int, fade_out_ms: float = 0.0):
         """Stream TTS audio chunks as raw PCM bytes.
@@ -1116,17 +1120,21 @@ class FrontendManager:
                 audio_s / e2e_s if e2e_s > 0 else 0,
             )
 
-    async def wait_for_tts_audio(self, uid: int, fade_out_ms: float = 0.0):
-        """Collect all TTS audio data and return as single bytes object."""
+    async def wait_for_tts_audio(
+        self, uid: int, fade_out_ms: float = 0.0
+    ) -> tuple[bytes, TTSFinishReason]:
+        """Collect TTS audio and the terminal generation reason."""
         t_start = self.start_time_map.pop(uid, None)
-        audio_data = b""
+        chunks = []
+        finish_reason: TTSFinishReason = "failed"
         async for ack in self.wait_for_ack(uid):
             if isinstance(ack, TTSAudioReply):
                 if ack.audio_data:
-                    audio_data += ack.audio_data
+                    chunks.append(ack.audio_data)
                 if ack.finished:
+                    finish_reason = ack.finish_reason or "failed"
                     break
-        audio_data = _apply_fade_out_pcm(audio_data, fade_out_ms)
+        audio_data = _apply_fade_out_pcm(b"".join(chunks), fade_out_ms)
         if t_start is not None:
             e2e_s = time.perf_counter() - t_start
             audio_s = len(audio_data) / (44100 * 4)
@@ -1135,11 +1143,45 @@ class FrontendManager:
                 uid, e2e_s * 1000, audio_s,
                 audio_s / e2e_s if e2e_s > 0 else 0,
             )
-        return audio_data
+        return audio_data, finish_reason
 
     def shutdown(self):
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
+
+
+class _TTSStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        state: FrontendManager,
+        uid: int,
+        headers: Mapping[str, str],
+        *,
+        wait_for_start: bool = False,
+        fade_out_ms: float = 0.0,
+    ) -> None:
+        self._state = state
+        self._uid = uid
+        self._wait_for_start = wait_for_start
+        super().__init__(
+            state.stream_tts_audio(uid, fade_out_ms=fade_out_ms),
+            media_type="audio/pcm",
+            headers=headers,
+        )
+
+    async def stream_response(self, send: Send) -> None:
+        # Wait before sending headers so a prompt error still returns HTTP 400.
+        # On ASGI 2.3 this wait runs alongside Starlette's disconnect listener.
+        if self._wait_for_start:
+            await self._state.wait_for_tts_start(self._uid)
+        await super().stream_response(send)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # The body iterator can be suspended or never started on disconnect.
+            self._state.abort_user(self._uid)
 
 
 @asynccontextmanager
@@ -1158,7 +1200,11 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-TTS-Continuation-ID"],
+    expose_headers=[
+        "X-TTS-Continuation-ID",
+        "X-TTS-Continuation-Status-URL",
+        "X-TTS-Generation-Status",
+    ],
 )
 
 
@@ -1239,36 +1285,36 @@ async def create_speech(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     uid = state.new_user()
 
-    await state.send_one(
-        TTSTokenizeMsg(
-            uid=uid,
-            text=req.input,
-            sampling_params=TTSSamplingParams(
-                max_tokens=max_tokens,
-                repetition_window=req.repetition_window,
-                repetition_penalty=req.repetition_penalty,
-                repetition_codebooks=req.repetition_codebooks,
-                emotion_cfg_scale=req.emotion_cfg_scale,
-            ),
-            speaker_embedding=speaker_embedding,
-            speaker_emotion_delta=speaker_emotion_delta,
-            speaking_rate_bucket=speaking_rate_bucket,
-            quality_buckets=_default_quality_buckets(state.config),
+    try:
+        await state.send_one(
+            TTSTokenizeMsg(
+                uid=uid,
+                text=req.input,
+                sampling_params=TTSSamplingParams(
+                    max_tokens=max_tokens,
+                    repetition_window=req.repetition_window,
+                    repetition_penalty=req.repetition_penalty,
+                    repetition_codebooks=req.repetition_codebooks,
+                    emotion_cfg_scale=req.emotion_cfg_scale,
+                ),
+                speaker_embedding=speaker_embedding,
+                speaker_emotion_delta=speaker_emotion_delta,
+                speaking_rate_bucket=speaking_rate_bucket,
+                quality_buckets=_default_quality_buckets(state.config),
+            )
         )
-    )
+    except BaseException:
+        state.abort_user(uid)
+        raise
 
-    async def _abort():
-        await state.abort_user(uid)
-
-    return StreamingResponse(
-        state.stream_tts_audio(uid),
-        media_type="audio/pcm",
+    return _TTSStreamingResponse(
+        state,
+        uid,
         headers={
             "X-Audio-Sample-Rate": "44100",
             "X-Audio-Channels": "1",
             "X-Audio-Format": "float32",
         },
-        background=BackgroundTask(_abort),
     )
 
 
@@ -1286,35 +1332,56 @@ async def _submit_tts_generation(
     try:
         if msg.retain_continuation:
             assert session_id is not None
+            continuation_id = state.continuations.reserve(session_id, msg)
             headers = {
                 **headers,
-                "X-TTS-Continuation-ID": state.continuations.reserve(session_id, msg),
+                "X-TTS-Continuation-ID": continuation_id,
+                "X-TTS-Continuation-Status-URL": f"/tts/continuations/{continuation_id}",
             }
         await state.send_one(msg)
-        if msg.retain_continuation or msg.continuation_context is not None:
-            await state.wait_for_tts_start(msg.uid)
     except ContinuationUnavailable as exc:
-        await state.abort_user(msg.uid)
+        state.abort_user(msg.uid)
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except BaseException:
-        await state.abort_user(msg.uid)
+        state.abort_user(msg.uid)
         raise
 
     if req.stream:
 
-        async def audio_stream():
-            try:
-                async for audio in state.stream_tts_audio(msg.uid, fade_out_ms=req.fade_out_ms):
-                    yield audio
-            finally:
-                await state.abort_user(msg.uid)
-
-        return StreamingResponse(audio_stream(), media_type="audio/pcm", headers=headers)
+        return _TTSStreamingResponse(
+            state,
+            msg.uid,
+            headers,
+            wait_for_start=msg.retain_continuation or msg.continuation_context is not None,
+            fade_out_ms=req.fade_out_ms,
+        )
     try:
-        audio_data = await state.wait_for_tts_audio(msg.uid, fade_out_ms=req.fade_out_ms)
-        return Response(content=audio_data, media_type="audio/pcm", headers=headers)
+        audio_data, finish_reason = await state.wait_for_tts_audio(
+            msg.uid, fade_out_ms=req.fade_out_ms
+        )
+        return Response(
+            content=audio_data, media_type="audio/pcm",
+            headers={**headers, "X-TTS-Generation-Status": finish_reason},
+        )
     finally:
-        await state.abort_user(msg.uid)
+        state.abort_user(msg.uid)
+
+
+@app.get("/tts/continuations/{continuation_id}")
+async def tts_continuation_status(
+    continuation_id: str,
+    response: Response,
+    x_tts_session_id: str | None = Header(default=None, alias="X-TTS-Session-ID"),
+) -> ContinuationStatus:
+    session_id = _normalize_session_id(x_tts_session_id)
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Continuation requires the X-TTS-Session-ID header.")
+    try:
+        status = get_global_state().continuations.status(continuation_id, session_id)
+    except ContinuationUnavailable as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    response.headers["Cache-Control"] = "no-store"
+    return status
 
 
 @app.post("/tts/generate")

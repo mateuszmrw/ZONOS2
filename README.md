@@ -202,21 +202,23 @@ disable it.
 
 ### Chain separate requests (Python server proof of concept)
 
-The Python server can retain audio tokens and their matching text between requests.
-The next request uses the saved first chunk and recent chunks as audio context.
-Each response contains only new audio.
+Audio tokens represent sound inside the model.
+Audio context pairs audio tokens with their text.
+Continuation uses audio context in the next request.
+The Python server continues the speech without replaying old audio.
 
-Run one API process with `--num-tokenizer 0` (the default).
-Send the same `X-TTS-Session-ID` header with every request in a chain.
-This client writes three responses to one PCM file:
+Run one Python API process with `--num-tokenizer 0` (the default).
+Send the same `X-TTS-Session-ID` value with each request in the chain.
+This example writes new audio from three responses to `chapter.pcm`:
 
 ```python
 import json
 import uuid
 from urllib.request import Request, urlopen
 
-url = "http://localhost:1919/tts/generate"
+base_url = "http://localhost:1919"
 session_id = uuid.uuid4().hex
+headers = {"Content-Type": "application/json", "X-TTS-Session-ID": session_id}
 paragraphs = ["The story begins here.", "The next paragraph follows.", "This is the ending."]
 continuation_id = None
 
@@ -224,7 +226,7 @@ with open("chapter.pcm", "wb") as output:
     for index, text in enumerate(paragraphs):
         body = {
             "text": text,
-            "stream": True,
+            "stream": False,
             "retain_continuation": index < len(paragraphs) - 1,
         }
         if continuation_id is None:
@@ -232,43 +234,96 @@ with open("chapter.pcm", "wb") as output:
             # Set speaker_embedding_id and other voice controls here, if needed.
         else:
             body["continuation_of"] = continuation_id
-        request = Request(url, data=json.dumps(body).encode(), headers={
-            "Content-Type": "application/json",
-            "X-TTS-Session-ID": session_id,
-        })
+        request = Request(f"{base_url}/tts/generate", data=json.dumps(body).encode(), headers=headers)
         with urlopen(request, timeout=300) as response:
-            continuation_id = response.headers.get("X-TTS-Continuation-ID")
-            while audio := response.read(65536):
-                output.write(audio)
+            if response.headers.get("X-TTS-Generation-Status") != "complete":
+                raise RuntimeError("Incomplete chunk; retry from the last good continuation ID.")
+            audio = response.read()
+            next_id = response.headers.get("X-TTS-Continuation-ID")
+            status_url = response.headers.get("X-TTS-Continuation-Status-URL")
+        if body["retain_continuation"]:
+            if not next_id or not status_url:
+                raise RuntimeError("No continuation context was retained.")
+            with urlopen(Request(base_url + status_url, headers=headers), timeout=10) as response:
+                if not json.load(response)["usable"]:
+                    raise RuntimeError("Unusable context; keep the last good continuation ID.")
+        output.write(audio)
+        continuation_id = next_id
 ```
 
-Set `retain_continuation: true` on the first request to receive `X-TTS-Continuation-ID`.
-Pass that ID as `continuation_of` on the next request.
-Read the complete response before you send the next request.
-Linked requests return a new ID unless you set `retain_continuation: false` for the final request.
+Set `retain_continuation: true` on the first request.
+The server returns an ID in `X-TTS-Continuation-ID`.
+Read the full response before you send the next request.
+Make sure that the context is [usable](#completion-and-retry).
+If the context is usable, send its ID as `continuation_of` in the next request.
 
-A linked request inherits the speaker, language, conditioning, and chunk configuration from its parent.
-Do not repeat or change those fields on linked requests.
+Each linked request returns a new ID by default.
+If you do not need another ID, set `retain_continuation: false` on the final request.
+
+A chunk pairs a piece of speech with its text.
+Conditioning controls how the model speaks.
+Each linked request uses the same speaker, language, conditioning, and chunk configuration as the previous request.
+Do not send those fields again on linked requests.
 You can change sampling controls such as `seed`, `temperature`, and `prefix_cfg_scale`.
-The default `long_form_window_chunks: 2` retains the previous chunk alongside the pinned first chunk.
-Retained requests suppress trailing-silence conditioning and trim three boundary frames, as intermediate long-form chunks do.
 
-The cache defaults to 32 entries, 300 seconds of retention, 4096 audio frames per entry, and 16384 transcript bytes per entry.
-The frame and text limits count both the first chunk and recent chunks.
-Set `ZONOS2_CONTINUATION_MAX_ENTRIES`, `ZONOS2_CONTINUATION_TTL_SECONDS`, `ZONOS2_CONTINUATION_MAX_FRAMES`, or `ZONOS2_CONTINUATION_MAX_TEXT_BYTES` before server startup to change these limits.
+With `long_form_pin_anchor: true`, the server keeps the first chunk in context.
+With the default `long_form_window_chunks: 2`, it also keeps the most recent chunk.
+If a request saves context, the server turns off the control for trailing silence.
+The server trims three frames from the end of a completed chunk before it saves that chunk.
+It does the same for chunks in the middle of a long-form request.
 
-The cache evicts older completed entries when it fills.
-Unknown, expired, or other-session IDs return HTTP 404.
-Pending or unusable context returns HTTP 409.
-If all cache entries are pending, a new retained request returns HTTP 503.
-If generation stops before the audio is complete, that response cannot supply continuation context.
-An error after streaming starts can end the response early.
+#### Cache limits
 
-This proof of concept does not persist context across server restarts or share it across API processes.
-The session header separates callers but does not authenticate them. Use a trusted local server for this version.
-Each response finishes its own audio decode. The next response uses prior decoder context without replaying its audio.
-The joins are not guaranteed to match one continuous decode sample for sample.
-Use a GPU listening test to assess voice consistency and boundary artifacts before deployment.
+The cache stores context between requests.
+The frame and text limits count the first chunk and the recent chunks.
+To change a limit, set its environment variable before you start the server:
+
+| Limit | Default | Environment variable |
+|-------|---------|----------------------|
+| Entries | 32 | `ZONOS2_CONTINUATION_MAX_ENTRIES` |
+| Seconds before an entry expires | 300 | `ZONOS2_CONTINUATION_TTL_SECONDS` |
+| Audio frames per entry | 4096 | `ZONOS2_CONTINUATION_MAX_FRAMES` |
+| Text bytes per entry | 16384 | `ZONOS2_CONTINUATION_MAX_TEXT_BYTES` |
+
+When the cache fills, the server removes older entries that are no longer pending.
+The server returns HTTP 404 for an unknown ID, an expired ID, or an ID from another session.
+If you try to reuse pending or unusable context, the server returns HTTP 409.
+If all entries in a full cache are pending, a new request that saves context returns HTTP 503.
+
+#### Completion and retry
+
+With `stream: false`, the server reports `complete`, `frame_limit`, or `failed` in `X-TTS-Generation-Status`.
+If generation reaches the frame limit, the server can return partial audio with HTTP 200.
+You cannot reuse this context.
+The model can detect the end of speech before it produces the last audio tokens.
+The context stays unusable if any of these tokens are missing.
+
+If the server returns `X-TTS-Continuation-Status-URL`, read all the audio first.
+Send a GET request to that URL with the same `X-TTS-Session-ID` value.
+The reply gives the `finish_reason` and tells you whether the context is `usable`.
+For `stream: true`, read the final status from this URL.
+The PCM stream does not include the final status.
+
+If generation reaches the frame limit, retry from the last usable ID.
+Use shorter text or increase `max_tokens` within the model limit.
+If the context exceeds a cache limit, use smaller chunks. The context can be unusable even when generation completes.
+In a single long-form request, the server stops at the first incomplete chunk.
+It does not use the text from an unfinished chunk to generate more audio.
+
+#### Limits of this proof of concept
+
+The server does not keep context after a restart or share it across API processes.
+The session header separates callers but does not authenticate them.
+Use a trusted local server for this version.
+
+The server decodes each response separately.
+The decoder uses saved audio tokens for the next response without replaying old audio.
+Where two responses meet, the audio can differ from one continuous decode.
+
+A cold start is the first render after startup.
+Fixed seeds control which tokens the model selects.
+They do not guarantee identical PCM after a cold start or across CUDA backends, hardware, and library versions.
+Before deployment, listen to audio from the target GPU for voice changes and audible joins.
 
 ### `POST /v1/audio/speech`
 

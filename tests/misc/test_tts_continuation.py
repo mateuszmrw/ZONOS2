@@ -14,6 +14,10 @@ import torch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
+from starlette.types import Message
+from zonos2.core import TTSReq
+from zonos2.core import TTSSamplingParams as RuntimeSamplingParams
 from zonos2.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
@@ -23,7 +27,7 @@ from zonos2.message import (
     TTSSamplingParams,
     TTSTokenizeMsg,
 )
-from zonos2.message.tts import TTSContinuationContext, TTSUserMsg
+from zonos2.message.tts import TTSContinuationContext, TTSFinishReason, TTSUserMsg
 from zonos2.server import api_server
 from zonos2.server.continuation import (
     ContinuationCache,
@@ -46,13 +50,13 @@ def _context(value: int = 7) -> TTSContinuationContext:
 
 
 def _roundtrip_request(msg: TTSTokenizeMsg) -> TTSTokenizeMsg:
-    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(cast(Any, msg)))
+    decoded: object = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(cast(Any, msg)))
     assert isinstance(decoded, TTSTokenizeMsg)
     return decoded
 
 
 def _roundtrip_reply(msg: TTSAudioReply) -> TTSAudioReply:
-    decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(cast(Any, msg)))
+    decoded: object = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(cast(Any, msg)))
     assert isinstance(decoded, TTSAudioReply)
     return decoded
 
@@ -64,7 +68,7 @@ def test_cache_not_ready_ownership_expiry_and_abort() -> None:
     with pytest.raises(ContinuationUnavailable) as pending:
         cache.get(key, "owner")
     assert pending.value.status_code == 409
-    cache.complete(1, _context())
+    cache.complete(1, _context(), finish_reason="complete")
     assert cache.get(key, "owner").continuation_context == _context()
     with pytest.raises(ContinuationUnavailable) as other:
         cache.get(key, "other")
@@ -86,7 +90,7 @@ def test_cache_capacity_and_frame_limit() -> None:
     with pytest.raises(ContinuationUnavailable) as busy:
         cache.reserve("owner", _template(2))
     assert busy.value.status_code == 503
-    cache.complete(1, _context())  # Anchor + recent window exceeds seven frames.
+    cache.complete(1, _context(), finish_reason="complete")  # Anchor + recent exceeds seven frames.
     with pytest.raises(ContinuationUnavailable, match="cache limit"):
         cache.get(key, "owner")
     replacement = cache.reserve("owner", _template(2))
@@ -107,9 +111,32 @@ def test_context_survives_actual_message_decoders() -> None:
     request = replace(_template(), continuation_context=_context())
     decoded_request = _roundtrip_request(request)
     assert decoded_request.continuation_context == _context()
-    reply = TTSAudioReply(1, b"", True, continuation_context=_context())
+    reply = TTSAudioReply(1, b"", True, continuation_context=_context(), finish_reason="complete")
     decoded_reply = _roundtrip_reply(reply)
     assert decoded_reply.continuation_context == _context()
+    assert decoded_reply.finish_reason == "complete"
+
+
+@pytest.mark.parametrize("codebook", range(9))
+@pytest.mark.parametrize("capped", [False, True])
+def test_scheduler_reason_requires_eos_drain(codebook: int, capped: bool) -> None:
+    request = TTSReq(
+        torch.zeros((2, 10), dtype=torch.int32),
+        table_idx=0, cached_len=0, output_len=17 if capped else 25,
+        uid=0, sampling_params=RuntimeSamplingParams(), cache_handle=cast(Any, None),
+    )
+    reason = None
+    for index in range(request.output_len):
+        request.complete_one()
+        frame = [10] * 9
+        if index == 15:
+            frame[codebook] = request.eoa_id
+        reason = request.update_finish_reason(frame, max_seq_len=200)
+        if reason is not None:
+            break
+    assert request.eos_frame == 15 - codebook
+    assert reason == ("frame_limit" if capped else "complete")
+    assert (request.eos_countdown > 0) == capped
 
 
 class _WorkerHarness:
@@ -120,6 +147,7 @@ class _WorkerHarness:
         self.replies: list[TTSAudioReply] = []
         self.prompts: list[TTSUserMsg] = []
         self.eos_frame: int | None = 30
+        self.finish_reason: TTSFinishReason = "complete"
         monkeypatch.setenv("ZONOS2_TTS_NORM", "0")
         monkeypatch.setattr(tokenizer_server, "ZmqPullQueue", lambda *args, **kwargs: self)
         monkeypatch.setattr(
@@ -127,7 +155,11 @@ class _WorkerHarness:
                 put=self._backend if addr == "backend" else self._frontend
             )
         )
-        monkeypatch.setattr(vocoder, "decode_dac", lambda codes: codes[:, :, 0].float().repeat_interleave(512, dim=1))
+        monkeypatch.setattr(
+            vocoder,
+            "decode_dac",
+            lambda codes: codes[:, :, 0].float().repeat_interleave(512, dim=1).cpu(),
+        )
 
     def get(self) -> Any:
         if not self.pending:
@@ -147,6 +179,7 @@ class _WorkerHarness:
             TTSDetokenizeMsg(
                 msg.uid, [value] * 9, finished=i == 39,
                 eos_frame=self.eos_frame if i == 39 else None,
+                finish_reason=self.finish_reason if i == 39 else None,
             ) for i in range(40)
         ]))
 
@@ -189,6 +222,53 @@ def test_worker_restores_anchor_and_recent_text_without_replaying_audio(monkeypa
         np.testing.assert_allclose(pcm, value, rtol=0, atol=2e-5)
 
 
+@pytest.mark.parametrize("retain", [False, True])
+@pytest.mark.parametrize("linked", [False, True])
+def test_worker_decodes_all_nine_codebooks_at_request_end(
+    monkeypatch: pytest.MonkeyPatch, retain: bool, linked: bool
+) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    eos, codebooks = 52, 9
+    aligned = [[20 + i * codebooks + j for j in range(codebooks)] for i in range(eos)]
+    raw = [
+        [aligned[i - j][j] if 0 <= i - j < eos else 1025 for j in range(codebooks)]
+        for i in range(eos + codebooks)
+    ]
+
+    def send_frames(msg: TTSUserMsg) -> None:
+        worker.pending.append(BatchTTSTokenizerMsg([
+            TTSDetokenizeMsg(
+                uid=msg.uid, audio_codes=row, finished=i == len(raw) - 1,
+                eos_frame=eos if i >= eos else None,
+                finish_reason="complete" if i == len(raw) - 1 else None,
+            )
+            for i, row in enumerate(raw)
+        ]))
+
+    decoded: set[tuple[int, ...]] = set()
+
+    def capture_dac(codes: torch.Tensor) -> torch.Tensor:
+        decoded.update(tuple(row) for row in codes[0].cpu().tolist() if row[0] >= 20)
+        return torch.zeros((1, codes.shape[1] * 512), dtype=torch.float32)
+
+    monkeypatch.setattr(worker, "_backend", send_frames)
+    monkeypatch.setattr(vocoder, "decode_dac", capture_dac)
+    replies = worker.run(replace(
+        _template(), long_form=False, retain_continuation=retain,
+        continuation_context=_context() if linked else None,
+    ))
+    kept = eos - 3 if retain else eos
+    assert replies[-1].finish_reason == "complete"
+    assert sum(len(reply.audio_data) for reply in replies) == kept * 512 * 4
+    context = replies[-1].continuation_context
+    if retain:
+        assert context is not None
+        assert context.history_codes == [raw[:kept]]
+    else:
+        assert context is None
+    assert decoded == {tuple(row) for row in aligned[:kept]}
+
+
 def test_worker_rejects_oversized_prompt_and_incomplete_context(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = _WorkerHarness(monkeypatch)
     replies = worker.run(replace(_template(), retain_continuation=True, max_prompt_frames=1))
@@ -196,9 +276,25 @@ def test_worker_rejects_oversized_prompt_and_incomplete_context(monkeypatch: pyt
     assert "model context" in str(replies[-1].error)
     assert not worker.prompts
     worker.eos_frame = None
+    worker.finish_reason = "frame_limit"
     replies = worker.run(replace(_template(), retain_continuation=True))
     assert replies[-1].continuation_context is None
     assert replies[-1].continuation_error
+    assert replies[-1].finish_reason == "frame_limit"
+
+
+def test_worker_stops_long_form_at_first_incomplete_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    worker.finish_reason = "frame_limit"  # EOS seen, but delayed codebooks did not finish.
+    result = worker.run(replace(
+        _template(), text="The first sentence. The second sentence.", retain_continuation=True,
+        long_form=True, long_form_chunk_chars=20, long_form_split_mode="sentence",
+    ))
+    assert len(worker.prompts) == 1
+    assert result[-1].finished
+    assert result[-1].finish_reason == "frame_limit"
+    assert result[-1].continuation_context is None
+    assert len(b"".join(reply.audio_data for reply in result)) == 30 * 512 * 4
 
 
 def test_prompt_budget_includes_speaker_markers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -220,7 +316,9 @@ def test_continuation_reuses_prefix_guidance(monkeypatch: pytest.MonkeyPatch) ->
     )
     worker.run(request)
     fresh = TTSPromptBuilder(TTSPromptConfig(text_vocab=519)).build(request.text)
-    assert torch.equal(worker.prompts[-1].cfg_uncond_input_ids, fresh)
+    unconditioned = worker.prompts[-1].cfg_uncond_input_ids
+    assert unconditioned is not None
+    assert torch.equal(unconditioned, fresh)
 
 
 def _frontend(monkeypatch: pytest.MonkeyPatch, worker: _WorkerHarness) -> api_server.FrontendManager:
@@ -268,14 +366,26 @@ def test_http_chaining_inherits_speaker_and_supports_final_stream(monkeypatch: p
         next_key = second.headers["X-TTS-Continuation-ID"]
         assert next_key != key
         assert worker.prompts[-1].sampling_params.temperature == 0.8
-        assert torch.equal(worker.prompts[-1].speaker_embedding, speaker)
+        embedding = worker.prompts[-1].speaker_embedding
+        assert embedding is not None
+        assert torch.equal(embedding, speaker)
         last = await api_server.tts_generate(
             api_server.TTSGenerateRequest(
                 text="Third paragraph.", continuation_of=next_key, retain_continuation=False, stream=True,
             ), "owner",
         )
         assert "X-TTS-Continuation-ID" not in last.headers
-        pcm = b"".join([chunk async for chunk in last.body_iterator])
+        body_parts: list[bytes] = []
+
+        async def receive() -> Message:
+            return await asyncio.Future[Message]()
+
+        async def send(message: Message) -> None:
+            if message["type"] == "http.response.body":
+                body_parts.append(message["body"])
+
+        await last({"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send)
+        pcm = b"".join(body_parts)
         assert len(pcm) == 30 * 512 * 4  # Final request keeps its normal ending.
         assert not state.ack_map and not state.event_map and not state.start_time_map
 
@@ -323,6 +433,60 @@ def test_http_route_returns_custom_header_and_pcm(monkeypatch: pytest.MonkeyPatc
         assert len(last.content) == 30 * 512 * 4
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("early_eos", [None, 30])
+def test_http_reports_truncation_and_retries_from_last_good_id(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, early_eos: int | None
+) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    _frontend(monkeypatch, worker)
+    headers = {"X-TTS-Session-ID": "owner"}
+    with TestClient(api_server.app) as client:
+        first = client.post(
+            "/tts/generate",
+            headers=headers,
+            json={"text": "First paragraph.", "stream": False, "retain_continuation": True},
+        )
+        assert first.headers["X-TTS-Generation-Status"] == "complete"
+        parent = first.headers["X-TTS-Continuation-ID"]
+        worker.eos_frame = early_eos
+        worker.finish_reason = "frame_limit"
+        failed = client.post(
+            "/tts/generate",
+            headers=headers,
+            json={"text": "This request cannot finish.", "continuation_of": parent, "stream": stream},
+        )
+        assert failed.status_code == 200
+        if not stream:
+            assert failed.headers["X-TTS-Generation-Status"] == "frame_limit"
+        status_url = failed.headers["X-TTS-Continuation-Status-URL"]
+        status = client.get(status_url, headers=headers)
+        assert status.headers["Cache-Control"] == "no-store"
+        assert status.json()["finish_reason"] == "frame_limit"
+        assert status.json()["usable"] is False
+        assert client.get(status_url, headers={"X-TTS-Session-ID": "other"}).status_code == 404
+        rejected = client.post(
+            "/tts/generate",
+            headers=headers,
+            json={"text": "Next.", "continuation_of": failed.headers["X-TTS-Continuation-ID"]},
+        )
+        assert rejected.status_code == 409
+        worker.eos_frame = 30
+        worker.finish_reason = "complete"
+        retry = client.post(
+            "/tts/generate",
+            headers=headers,
+            json={
+                "text": "A shorter retry.", "continuation_of": parent,
+                "retain_continuation": False, "stream": False,
+            },
+        )
+        assert retry.headers["X-TTS-Generation-Status"] == "complete"
+        pcm = np.frombuffer(retry.content, dtype=np.float32)
+        assert len(pcm) == 30 * 512
+        np.testing.assert_allclose(pcm, 103.0, rtol=0, atol=2e-5)
+
+
 def test_http_checks_owner_pending_settings_and_tokenizer_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = _WorkerHarness(monkeypatch)
 
@@ -339,9 +503,9 @@ def test_http_checks_owner_pending_settings_and_tokenizer_mode(monkeypatch: pyte
 
         await rejected("other", 404)
         await rejected("owner", 409)
-        state.continuations.complete(1, _context())
+        state.continuations.complete(1, _context(), finish_reason="complete")
         await rejected("owner", 400, language="de")
-        state.config.num_tokenizer = 1
+        monkeypatch.setattr(state.config, "num_tokenizer", 1)
         await rejected("owner", 400)
         assert not worker.prompts
 
@@ -350,15 +514,99 @@ def test_http_checks_owner_pending_settings_and_tokenizer_mode(monkeypatch: pyte
 
 def test_http_reports_prompt_error_before_opening_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = _WorkerHarness(monkeypatch)
+    state = _frontend(monkeypatch, worker)
+    monkeypatch.setattr(state.config, "max_seq_len", 2)
+    with TestClient(api_server.app) as client:
+        response = client.post(
+            "/tts/generate",
+            headers={"X-TTS-Session-ID": "owner"},
+            json={"text": "First.", "retain_continuation": True, "stream": True},
+        )
+    assert response.status_code == 400
+    assert "model context" in response.json()["detail"]
+    assert not state.ack_map and not state.event_map and not state.start_time_map
+
+
+@pytest.mark.parametrize(
+    "spec, disconnect_at",
+    [
+        ("2.3", "waiting_for_audio"),
+        ("2.3", "http.response.start"),
+        ("2.3", "http.response.body"),
+        ("2.4", "http.response.start"),
+        ("2.4", "http.response.body"),
+    ],
+)
+def test_stream_disconnect_cleans_request_and_preserves_parent(
+    monkeypatch: pytest.MonkeyPatch, spec: str, disconnect_at: str
+) -> None:
+    worker = _WorkerHarness(monkeypatch)
 
     async def scenario() -> None:
         state = _frontend(monkeypatch, worker)
-        state.config.max_seq_len = 2
-        with pytest.raises(HTTPException, match="model context"):
-            await api_server.tts_generate(
-                api_server.TTSGenerateRequest(text="First.", retain_continuation=True), "owner",
-            )
+        parent = await api_server.tts_generate(
+            api_server.TTSGenerateRequest(text="First.", stream=False, retain_continuation=True),
+            "owner",
+        )
+        parent_id = parent.headers["X-TTS-Continuation-ID"]
+        submitted: asyncio.Queue[TTSTokenizeMsg] = asyncio.Queue()
+        waiting = asyncio.Event()
+        disconnected = asyncio.Event()
+        wait_for_tts_start = state.wait_for_tts_start
+
+        async def observe_start(uid: int) -> None:
+            waiting.set()
+            await wait_for_tts_start(uid)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(state, "send_one", submitted.put)
+            mp.setattr(state, "wait_for_tts_start", observe_start)
+            response_task = asyncio.create_task(api_server.tts_generate(
+                api_server.TTSGenerateRequest(text="Next.", continuation_of=parent_id, stream=True),
+                "owner",
+            ))
+            msg = await asyncio.wait_for(submitted.get(), timeout=2)
+            if disconnect_at != "waiting_for_audio":
+                state.ack_map[msg.uid].append(TTSAudioReply(msg.uid, b"\0" * 4, False))
+                state.event_map[msg.uid].set()
+            response = await asyncio.wait_for(response_task, timeout=2)
+            child_id = response.headers["X-TTS-Continuation-ID"]
+
+            async def receive() -> Message:
+                when = waiting if disconnect_at == "waiting_for_audio" else disconnected
+                await when.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message: Message) -> None:
+                if message["type"] != disconnect_at:
+                    return
+                if spec == "2.4":
+                    raise OSError("Client closed the connection")
+                disconnected.set()
+                if disconnect_at == "http.response.start":
+                    # Hold the header send open so the iterator cannot start.
+                    await asyncio.Future[None]()
+
+            exchange = response({"type": "http", "asgi": {"spec_version": spec}}, receive, send)
+            if spec == "2.4":
+                with pytest.raises(ClientDisconnect):
+                    await asyncio.wait_for(exchange, timeout=2)
+            else:
+                await asyncio.wait_for(exchange, timeout=2)
+
         assert not state.ack_map and not state.event_map and not state.start_time_map
+        with pytest.raises(ContinuationUnavailable) as gone:
+            state.continuations.get(child_id, "owner")
+        assert gone.value.status_code == 404
+        assert state.continuations.status(parent_id, "owner").usable
+        retry = await api_server.tts_generate(
+            api_server.TTSGenerateRequest(
+                text="Try again.", continuation_of=parent_id,
+                retain_continuation=False, stream=False,
+            ),
+            "owner",
+        )
+        assert retry.headers["X-TTS-Generation-Status"] == "complete"
 
     asyncio.run(scenario())
 
@@ -372,7 +620,7 @@ def test_failed_submission_removes_pending_context(monkeypatch: pytest.MonkeyPat
         async def fail(msg: Any) -> None:
             raise RuntimeError("Synthetic transport failure")
 
-        state.send_tokenizer.put = fail
+        monkeypatch.setattr(state.send_tokenizer, "put", fail)
         with pytest.raises(RuntimeError, match="Synthetic transport failure"):
             await api_server.tts_generate(
                 api_server.TTSGenerateRequest(text="First.", retain_continuation=True), "owner",
