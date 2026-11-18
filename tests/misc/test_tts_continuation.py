@@ -370,6 +370,154 @@ def test_worker_decodes_all_nine_codebooks_at_request_end(
     assert decoded == {tuple(row) for row in aligned[:kept]}
 
 
+@pytest.mark.parametrize("link_short_chunk", [False, True])
+def test_worker_preserves_playback_tokens_across_short_branch_seams(
+    monkeypatch: pytest.MonkeyPatch, link_short_chunk: bool,
+) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    lengths = (47, 1, 3, 52)
+    delay = 8
+    generated = [
+        [[(offset + i * 9 + j) % 1024 for j in range(9)] for i in range(length + delay)]
+        for offset, length in zip((31, 349, 476, 503), lengths, strict=True)
+    ]
+    # The decoder must see both sides together, but each frame must get its own
+    # delayed codes. If chunk 3's prompt ends with chunk 2, it can fill chunk 2's
+    # delay without changing chunk 1's already preserved ending.
+    monkeypatch.setattr(
+        vocoder, "decode_dac",
+        lambda codes: codes.sum(dim=-1).float().repeat_interleave(512, dim=1).cpu(),
+    )
+
+    def render(
+        i: int, uid: int, parent: TTSContinuationContext | None, tail: TTSAudioTail | None,
+    ) -> tuple[bytes, TTSAudioReply]:
+        rows = generated[i]
+        defer = i < 3
+
+        def send_frames(msg: TTSUserMsg) -> None:
+            worker.pending.append(BatchTTSTokenizerMsg([
+                TTSDetokenizeMsg(
+                    msg.uid, row, finished=k == len(rows) - 1,
+                    eos_frame=lengths[i] + (3 if defer else 0) if k == len(rows) - 1 else None,
+                    finish_reason="complete" if k == len(rows) - 1 else None,
+                )
+                for k, row in enumerate(rows)
+            ]))
+
+        monkeypatch.setattr(worker, "_backend", send_frames)
+        replies = worker.run(_roundtrip_request(replace(
+            _template(uid), long_form=False, retain_continuation=defer, defer_audio_tail=defer,
+            continuation_context=parent, audio_tail=tail,
+        )))
+        reply = _roundtrip_reply(replies[-1])
+        assert reply.finish_reason == "complete"
+        return b"".join(r.audio_data for r in replies), reply
+
+    def expected_audio(*groups: tuple[list[list[int]], int]) -> np.ndarray:
+        sums = [sum(rows[i + j][j] for j in range(9)) for rows, n in groups for i in range(n)]
+        return np.repeat(sums, 512)
+
+    a, b, c, d = generated
+    groups = (
+        ((a, 47), ([b[0], *c], 4))
+        if link_short_chunk else ((a, 47), (b, 1), (c, 3))
+    )
+    reference = _context()
+    first, first_reply = render(0, 1, None, None)
+    assert first_reply.audio_tail is not None
+    second, second_reply = render(1, 2, reference, first_reply.audio_tail)
+    assert second_reply.audio_tail is not None and second_reply.continuation_context is not None
+    assert second_reply.continuation_context.history_codes == [b[:1]]
+    third, third_reply = render(
+        2, 3, second_reply.continuation_context if link_short_chunk else reference, second_reply.audio_tail,
+    )
+    tail = third_reply.audio_tail
+    assert tail is not None
+    prefix = first + second + third
+    finished = worker.run(TTSFinishAudioMsg(4, tail))[-1]
+    np.testing.assert_allclose(
+        np.frombuffer(prefix + finished.audio_data, dtype=np.float32),
+        expected_audio(*groups), rtol=0, atol=0.001,
+    )
+    final, final_reply = render(3, 5, reference, tail)
+    retry, _ = render(3, 6, reference, tail)
+    assert final_reply.audio_tail is None
+    assert final == retry
+    assert worker.run(TTSFinishAudioMsg(7, tail))[-1] == replace(finished, uid=7)
+    np.testing.assert_allclose(
+        np.frombuffer(prefix + final, dtype=np.float32),
+        expected_audio(*groups, (d, 52)), rtol=0, atol=0.001,
+    )
+
+
+def test_worker_checks_playback_against_the_prefix_actually_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    monkeypatch.setattr(
+        vocoder, "decode_dac",
+        lambda codes: codes.sum(dim=-1).float().repeat_interleave(512, dim=1).cpu(),
+    )
+    # The model and playback IDs could stay linked at every request, but an
+    # anchor-only prompt stops including the just-played chunk after the first.
+    template = replace(_template(), long_form_window_chunks=1, long_form=False)
+    request = replace(template, retain_continuation=True, defer_audio_tail=True)
+    first = worker.run(request)
+    second = worker.run(replace(
+        request, uid=2, continuation_context=first[-1].continuation_context, audio_tail=first[-1].audio_tail,
+    ))
+    assert second[-1].continuation_context is not None and second[-1].audio_tail is not None
+    final = worker.run(replace(
+        template, uid=3, continuation_context=second[-1].continuation_context,
+        audio_tail=second[-1].audio_tail,
+    ))
+    audio = np.frombuffer(b"".join(r.audio_data for r in first + second + final), dtype=np.float32)
+    # "101" actually used in chunk 2's prompt: let chunk 2's rows complete its
+    # ending. "102" not used in chunk 3's prompt: keep its original ending.
+    expected = [
+        *([101 * 9] * 19), *(101 * i + 102 * (9 - i) for i in range(8, 0, -1)),
+        *([102 * 9] * 27), *([103 * 9] * 30),
+    ]
+    np.testing.assert_allclose(audio, np.repeat(expected, 512), rtol=0, atol=0.001)
+
+
+def test_matching_prefixes_keep_the_continuous_decoder_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = ("First sentence.", "Second sentence.", "Last sentence.")
+    template = replace(
+        _template(), long_form=True, long_form_chunk_chars=16, long_form_split_mode="sentence",
+    )
+
+    def decode_with_right_context(codes: torch.Tensor) -> torch.Tensor:
+        current = codes.sum(dim=-1).float()
+        # Make the decoded frame depend on the next frame's codes.
+        right = torch.nn.functional.pad(current[:, 1:], (0, 1))
+        return (current + right).repeat_interleave(512, dim=1).cpu()
+
+    worker = _WorkerHarness(monkeypatch)
+    monkeypatch.setattr(vocoder, "decode_dac", decode_with_right_context)
+    whole = worker.run(replace(template, text=" ".join(chunks)))
+    whole_prompts = [p.input_ids for p in worker.prompts]
+    assert len(whole_prompts) == len(chunks)
+
+    worker = _WorkerHarness(monkeypatch)
+    monkeypatch.setattr(vocoder, "decode_dac", decode_with_right_context)
+    first = worker.run(replace(
+        template, text=" ".join(chunks[:-1]), retain_continuation=True, defer_audio_tail=True,
+    ))
+    saved = _roundtrip_reply(first[-1])
+    assert saved.audio_tail is not None and saved.continuation_context is not None
+    final = worker.run(_roundtrip_request(replace(
+        template, uid=2, text=chunks[-1],
+        continuation_context=saved.continuation_context, audio_tail=saved.audio_tail,
+    )))
+    assert all(
+        torch.equal(prev, new.input_ids)
+        for prev, new in zip(whole_prompts, worker.prompts, strict=True)
+    )
+    continuous_pcm = b"".join(r.audio_data for r in whole)
+    assert len(continuous_pcm) == (27 * 2 + 30) * 512 * 4
+    assert b"".join(r.audio_data for r in first + final) == continuous_pcm
+
+
 def test_worker_rejects_oversized_prompt_and_incomplete_context(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = _WorkerHarness(monkeypatch)
     replies = worker.run(replace(_template(), retain_continuation=True, max_prompt_frames=1))

@@ -38,6 +38,22 @@ from zonos2.tts.prompt import TTSPromptBuilder, TTSPromptConfig
 from zonos2.utils import ZmqPullQueue, ZmqPushQueue, init_logger
 
 
+def _extend_sources(
+    sources: List[str | None], source: str | None, frames: int, limit: int,
+) -> List[str | None]:
+    """Keep only the suffix that can still use delayed codebook columns."""
+    if frames >= limit:
+        return [source] * limit
+    return [*sources[frames - limit:], *([source] * frames)]
+
+
+def _matching_suffix_frames(playback: List[str | None], prefix: List[str | None]) -> int:
+    for i, (left, right) in enumerate(zip(reversed(playback), reversed(prefix))):
+        if left is None or left != right:
+            return i
+    return min(len(playback), len(prefix))
+
+
 @dataclass
 class _LongFormState:
     """Per-request state driving windowed teacher-forced continuation.
@@ -52,9 +68,9 @@ class _LongFormState:
 
     Generated frames stream to the client through one continuous vocoder buffer
     (keyed by the request uid), with ``finished`` withheld until the final chunk
-    so there are no boundary artifacts. ``committed`` tracks how many of the
-    current chunk's frames have already been fed to the vocoder (we hold back a
-    tail margin while streaming so EOA/post-content frames are never decoded).
+    so the decoder can use audio on both sides of a join. ``committed`` tracks
+    how many of the current chunk's frames have already been fed to the vocoder
+    (we hold back a tail margin so EOA/post-content frames are never decoded).
     """
 
     chunks: List[str]
@@ -80,6 +96,10 @@ class _LongFormState:
     retain_continuation: bool = False
     max_prompt_frames: int | None = None
     defer_audio_tail: bool = False
+    anchor_source: str | None = None
+    history_sources: List[str | None] = field(default_factory=list)
+    track_audio: bool = False
+    playback_sources: List[str | None] = field(default_factory=list)
 
     @property
     def is_last(self) -> bool:
@@ -89,7 +109,7 @@ class _LongFormState:
     def open_end(self) -> bool:
         return not self.is_last or self.retain_continuation or self.defer_audio_tail
 
-    def accept_chunk(self, kept: List[List[int]]) -> _LongFormState:
+    def accept_chunk(self, kept: List[List[int]], source: str, delay: int) -> _LongFormState:
         first = self.prior_chunks + self.index == 0
         return replace(
             self,
@@ -103,6 +123,15 @@ class _LongFormState:
                 [*self.history_codes, kept][-self.context_chunks:]
                 if self.context_chunks else []
             ),
+            anchor_source=source if first and self.pin_anchor else self.anchor_source,
+            history_sources=(
+                [*self.history_sources, source][-self.context_chunks:]
+                if self.context_chunks else []
+            ),
+            playback_sources=(
+                _extend_sources(self.playback_sources, source, len(kept), delay)
+                if self.track_audio else []
+            ),
         )
 
     def snapshot(self) -> TTSContinuationContext:
@@ -112,6 +141,8 @@ class _LongFormState:
             anchor_codes=self.anchor_codes,
             history_text=self.history_text,
             history_codes=self.history_codes,
+            anchor_source=self.anchor_source,
+            history_sources=self.history_sources,
         )
 
 
@@ -230,7 +261,9 @@ def tokenize_worker(
             t = torch.cat([state.speaker_slot.to(dtype=t.dtype), t], dim=0)
         return t
 
-    def _build_chunk_user_msg(state: _LongFormState, uid: int) -> TTSUserMsg:
+    def _build_chunk_user_msg(
+        state: _LongFormState, uid: int,
+    ) -> tuple[TTSUserMsg, List[str | None]]:
         q = state.nonfinal_quality if state.open_end else state.final_quality
         # Whole prior chunks: the rolling recent window plus, when the anchor has
         # scrolled out of it, the pinned first chunk (middle evicted).
@@ -245,6 +278,13 @@ def tokenize_worker(
         ) + list(state.history_codes)
         context_text = " ".join(texts)
         context_codes = [f for chunk in code_chunks for f in chunk]
+        prefix_sources: List[str | None] = []
+        if state.track_audio:
+            # Use the chunks actually in the prompt, not the context ID. A
+            # pinned anchor may be the only chunk left in the model prefix.
+            sources = ([state.anchor_source] if prepend_anchor else []) + state.history_sources
+            for chunk, source in zip(code_chunks, sources, strict=True):
+                prefix_sources = _extend_sources(prefix_sources, source, len(chunk), n_codebooks - 1)
         cfg_uncond_input_ids = None
         if not context_codes:
             # First chunk, or teacher forcing disabled: generate fresh
@@ -291,7 +331,7 @@ def tokenize_worker(
             clean_speaker_background=state.clean_speaker_background,
             accurate_mode=state.accurate_mode,
             cfg_uncond_input_ids=cfg_uncond_input_ids,
-        )
+        ), prefix_sources
 
     def _vocode(
         uid: int, frames: List[List[int]], finished: bool, *,
@@ -395,6 +435,10 @@ def tokenize_worker(
                             retain_continuation=msg.retain_continuation,
                             max_prompt_frames=msg.max_prompt_frames,
                             defer_audio_tail=msg.defer_audio_tail,
+                            track_audio=msg.defer_audio_tail or msg.audio_tail is not None,
+                            playback_sources=(
+                                msg.audio_tail.playback_sources if msg.audio_tail is not None else []
+                            ),
                         )
                         previous = msg.continuation_context
                         if previous is not None:
@@ -405,9 +449,13 @@ def tokenize_worker(
                                 anchor_codes=previous.anchor_codes,
                                 history_text=previous.history_text,
                                 history_codes=previous.history_codes,
+                                anchor_source=previous.anchor_source,
+                                history_sources=(
+                                    previous.history_sources or [None] * len(previous.history_codes)
+                                ),
                             )
                         try:
-                            first_msg = _build_chunk_user_msg(state, msg.uid)
+                            first_msg, prefix_sources = _build_chunk_user_msg(state, msg.uid)
                         except ValueError as exc:
                             send_frontend.put(
                                 TTSAudioReply(
@@ -417,7 +465,12 @@ def tokenize_worker(
                             )
                             continue
                         if msg.audio_tail is not None:
-                            tts_vocoder_manager.resume(msg.uid, msg.audio_tail)
+                            tts_vocoder_manager.resume(
+                                msg.uid, msg.audio_tail,
+                                matching_frames=_matching_suffix_frames(
+                                    state.playback_sources, prefix_sources,
+                                ),
+                            )
                         elif previous is not None and previous.history_codes:
                             tts_vocoder_manager.prime(msg.uid, previous.history_codes[-1])
                         longform_states[msg.uid] = state
@@ -537,16 +590,23 @@ def tokenize_worker(
                         finish_reason = "failed"
                     new = kept[state.committed:] if state.committed < len(kept) else []
                     defer = is_last and usable and state.defer_audio_tail
-                    # Use the next chunk for alignment and DAC context on an open track.
-                    # These extra rows are only a fallback when the caller ends the track here.
-                    lookahead = state.raw[len(kept):len(kept) + n_codebooks - 1] if is_last else []
+                    # These rows finish this chunk's own delayed columns when
+                    # there is no successor or the next prompt lacks this audio.
+                    lookahead = (
+                        state.raw[len(kept):len(kept) + n_codebooks - 1]
+                        if is_last or state.track_audio else []
+                    )
                     audio = _vocode(
                         msg.uid, new, finished=is_last and not defer,
-                        final_lookahead=lookahead if not defer else (),
+                        final_lookahead=lookahead if is_last and not defer else (),
                     )
-                    tail = tts_vocoder_manager.suspend(msg.uid, lookahead=lookahead) if defer else None
                     if usable:
-                        state = state.accept_chunk(kept)
+                        state = state.accept_chunk(kept, f"{msg.uid}:{state.index}", n_codebooks - 1)
+                    tail = (
+                        tts_vocoder_manager.suspend(
+                            msg.uid, lookahead=lookahead, playback_sources=state.playback_sources,
+                        ) if defer else None
+                    )
                     if audio or is_last:
                         replies.append(
                             TTSAudioReply(
@@ -570,7 +630,7 @@ def tokenize_worker(
                     else:
                         state = replace(state, index=state.index + 1, raw=[], committed=0)
                         try:
-                            next_msg = _build_chunk_user_msg(state, msg.uid)
+                            next_msg, prefix_sources = _build_chunk_user_msg(state, msg.uid)
                         except ValueError as exc:
                             active_uids.discard(msg.uid)
                             longform_states.pop(msg.uid, None)
@@ -582,6 +642,13 @@ def tokenize_worker(
                                 )
                             )
                         else:
+                            if state.track_audio:
+                                tts_vocoder_manager.join(
+                                    msg.uid, lookahead=lookahead,
+                                    matching_frames=_matching_suffix_frames(
+                                        state.playback_sources, prefix_sources,
+                                    ),
+                                )
                             longform_states[msg.uid] = state
                             backend_submits.append(next_msg)
 

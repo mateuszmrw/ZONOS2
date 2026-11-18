@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Literal, cast
 
 import torch
@@ -73,6 +73,9 @@ class TTSContinuationContext:
     anchor_codes: List[List[int]]
     history_text: List[str]
     history_codes: List[List[List[int]]]
+    # IDs of the generated chunks, not of the HTTP cache entries.
+    anchor_source: str | None = None
+    history_sources: List[str | None] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,12 @@ class TTSAudioTail:
     frames: List[List[int]]
     decoded_frames: int
     overlap_pcm: bytes
-    lookahead: List[List[int]]  # Only used when ending the track here.
+    lookahead: List[List[int]]  # Saved delay rows, not extra output frames.
+    # Sources of the last n_codebooks - 1 playback frames, oldest first.
+    playback_sources: List[str | None] = field(default_factory=list)
+    # Number of ending frames still allowed to take delayed codes from a
+    # matching model prefix. None means no earlier join has fixed those codes.
+    open_frames: int | None = None
 
 
 @dataclass

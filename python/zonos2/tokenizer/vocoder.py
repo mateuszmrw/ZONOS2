@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Dict, List
 
 import numpy as np
@@ -71,6 +72,22 @@ def decode_dac(codes: torch.Tensor) -> torch.Tensor:
     return audio
 
 
+@dataclass(frozen=True)
+class _DelayedJoin:
+    """Saved columns for left-side frames that the new model prefix lacks."""
+
+    open_frames: int
+    rows: Sequence[Sequence[int]]
+
+    def merge(self, row: Sequence[int], offset: int = 0) -> List[int]:
+        if offset >= len(self.rows):
+            return list(row)
+        # Column j in incoming row i plays at seam + i - j. Only take
+        # columns that play before the shared suffix of the old audio.
+        split = self.open_frames + offset + 1
+        return [*row[:split], *self.rows[offset][split:]]
+
+
 class TTSVocoderManager:
     """Converts audio codebook tokens to PCM audio using DAC.
 
@@ -119,6 +136,7 @@ class TTSVocoderManager:
         self._decoded_counts: Dict[int, int] = {}
         self._eos_frames: Dict[int, int] = {}
         self._overlap_tails: Dict[int, np.ndarray] = {}
+        self._delayed_joins: Dict[int, _DelayedJoin] = {}
 
         # Crossfade window cache
         self._window_cache: Dict[int, np.ndarray] = {}
@@ -136,21 +154,27 @@ class TTSVocoderManager:
         self._frame_buffers = {**self._frame_buffers, uid: prefix}
         self._decoded_counts = {**self._decoded_counts, uid: len(prefix)}
 
-    def suspend(self, uid: int, *, lookahead: Sequence[Sequence[int]]) -> TTSAudioTail:
+    def suspend(
+        self, uid: int, *, lookahead: Sequence[Sequence[int]],
+        playback_sources: Sequence[str | None] = (),
+    ) -> TTSAudioTail:
         """Save only what the next incremental decode can still use."""
         decoded = self._decoded_counts[uid]
         start = max(0, decoded - self.overlap_frames)
         overlap = self._overlap_tails.get(uid)
+        join = self._delayed_joins.get(uid)
         tail = TTSAudioTail(
             frames=[list(row) for row in self._frame_buffers[uid][start:]],
             decoded_frames=decoded - start,
             overlap_pcm=overlap.tobytes() if overlap is not None else b"",
-            lookahead=[list(row) for row in lookahead],
+            lookahead=self._merge_lookahead(uid, lookahead),
+            playback_sources=list(playback_sources),
+            open_frames=join.open_frames if join is not None else None,
         )
         self.reset(uid)
         return tail
 
-    def resume(self, uid: int, tail: TTSAudioTail) -> None:
+    def resume(self, uid: int, tail: TTSAudioTail, *, matching_frames: int | None = None) -> None:
         """Continue the same decoder timeline without replaying emitted samples."""
         self.reset(uid)
         self._frame_buffers = {**self._frame_buffers, uid: [list(row) for row in tail.frames]}
@@ -159,6 +183,32 @@ class TTSVocoderManager:
             self._overlap_tails = {
                 **self._overlap_tails, uid: np.frombuffer(tail.overlap_pcm, dtype=np.float32),
             }
+        shared = self.n_codebooks - 1 if matching_frames is None else matching_frames
+        if tail.open_frames is not None:
+            shared = min(shared, tail.open_frames)
+        self.join(uid, lookahead=tail.lookahead, matching_frames=shared)
+
+    def join(
+        self, uid: int, *, lookahead: Sequence[Sequence[int]], matching_frames: int,
+    ) -> None:
+        """Keep unshared left-side codes, without adding rows to the playback."""
+        previous = self._delayed_joins.get(uid)
+        if previous is not None:
+            # A short segment may not have supplied all rows for an older
+            # join. Carry that older ending forward as well.
+            lookahead = self._merge_lookahead(uid, lookahead)
+            matching_frames = min(matching_frames, previous.open_frames)
+        remaining = self.n_codebooks - 1 - matching_frames
+        if remaining > 0 and lookahead:
+            self._delayed_joins[uid] = _DelayedJoin(matching_frames, lookahead[:remaining])
+        else:
+            self._delayed_joins.pop(uid, None)
+
+    def _merge_lookahead(
+        self, uid: int, rows: Sequence[Sequence[int]],
+    ) -> List[List[int]]:
+        join = self._delayed_joins.get(uid)
+        return [join.merge(row, i) if join is not None else list(row) for i, row in enumerate(rows)]
 
     def decode_frames(
         self,
@@ -199,7 +249,15 @@ class TTSVocoderManager:
                 self._eos_frames[uid] = max(0, int(msg.eos_frame))
 
             # Accumulate frame
-            self._frame_buffers[uid].append(msg.audio_codes)
+            frame = msg.audio_codes
+            join = self._delayed_joins.get(uid)
+            if join is not None:
+                frame = join.merge(frame)
+                if len(join.rows) > 1:
+                    self._delayed_joins[uid] = _DelayedJoin(join.open_frames + 1, join.rows[1:])
+                else:
+                    self._delayed_joins.pop(uid)
+            self._frame_buffers[uid].append(frame)
 
             if msg.finished:
                 lookahead = final_lookahead if i == len(msgs) - 1 else ()
@@ -284,7 +342,7 @@ class TTSVocoderManager:
         raw_end = target_frames + delay
         raw_slice: Sequence[Sequence[int]] = buffer[decode_start:raw_end]
         if raw_end > total and lookahead:
-            raw_slice = [*raw_slice, *lookahead[:raw_end - total]]
+            raw_slice = [*raw_slice, *self._merge_lookahead(uid, lookahead[:raw_end - total])]
 
         # --- shear_up and take output frames ---
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -359,8 +417,10 @@ class TTSVocoderManager:
             self._decoded_counts.pop(uid, None)
             self._eos_frames.pop(uid, None)
             self._overlap_tails.pop(uid, None)
+            self._delayed_joins.pop(uid, None)
         else:
             self._frame_buffers.clear()
             self._decoded_counts.clear()
             self._eos_frames.clear()
             self._overlap_tails.clear()
+            self._delayed_joins.clear()
