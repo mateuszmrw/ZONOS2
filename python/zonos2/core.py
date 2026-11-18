@@ -167,17 +167,17 @@ class TTSReq:
         return self.remain_len > 0 and self.eos_countdown != 0
 
     def update_finish_reason(
-        self, audio_codes: List[int], max_seq_len: int
+        self, audio_codes: List[int], max_seq_len: int, *, steps_ahead: int = 0,
     ) -> TTSFinishReason | None:
         # EOS wins if its countdown finishes on the exact frame limit. Seeing EOS
         # without the rest of the delayed codebooks does not complete the chunk.
-        if self.check_eos(audio_codes):
+        if self.check_eos(audio_codes, frame_index=self.total_generated - 1 - steps_ahead):
             return "complete"
-        if self.remain_len <= 0 or self.device_len >= max_seq_len - 1:
+        if self.device_len - steps_ahead >= min(self.max_device_len, max_seq_len - 1):
             return "frame_limit"
         return None
 
-    def check_eos(self, audio_codes: List[int]) -> bool:
+    def check_eos(self, audio_codes: List[int], *, frame_index: int | None = None) -> bool:
         """Check for EOS and update countdown state.
 
         Args:
@@ -192,9 +192,8 @@ class TTSReq:
         # Match Zonos2 reference inference: any sampled EOA codebook starts the
         # delayed stop countdown. The aligned frame is shifted back by the
         # highest EOA codebook index and clamped at zero.
-        # Use total_generated because this request only sees one decode frame at a time.
         if self.eos_frame < 0:
-            step = self.total_generated - 1
+            step = self.total_generated - 1 if frame_index is None else frame_index
             eos_cols = [c == self.eoa_id for c in audio_codes[: self.n_codebooks]]
             if any(eos_cols):
                 # First EOS: compute aligned frame

@@ -4,22 +4,24 @@ import asyncio
 import base64
 import hashlib
 import io
+import math
 import os
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Tuple, TypeVar
 
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.requests import ClientDisconnect
 from starlette.types import Receive, Scope, Send
 from zonos2.message import (
     BaseFrontendMsg,
@@ -29,6 +31,7 @@ from zonos2.message import (
     TTSSamplingParams,
     TTSTokenizeMsg,
 )
+from zonos2.message.tokenizer import AbortMsg
 from zonos2.message.tts import TTSFinishReason
 from zonos2.tts.audio import (
     _decode_audio_bytes,
@@ -992,6 +995,13 @@ class TTSSpeakerCacheRequest(BaseModel):
     speaker_wav_base64: str | None = None
 
 
+def _worker_timeout() -> float:
+    value = float(os.getenv("ZONOS2_TTS_WORKER_TIMEOUT_SECONDS", "60"))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("ZONOS2_TTS_WORKER_TIMEOUT_SECONDS must be positive and finite.")
+    return value
+
+
 @dataclass
 class FrontendManager:
     config: ServerArgs
@@ -1002,6 +1012,9 @@ class FrontendManager:
     ack_map: Dict[int, List[TTSAudioReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
     start_time_map: Dict[int, float] = field(default_factory=dict)
+    worker_timeout: float = field(default_factory=_worker_timeout)
+    active_workers: set[int] = field(default_factory=set)
+    cancel_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     continuations: ContinuationCache = field(
         default_factory=lambda: ContinuationCache(ContinuationCacheConfig.from_env())
     )
@@ -1018,10 +1031,11 @@ class FrontendManager:
         while True:
             msg = await self.recv_tokenizer.get()
             for msg in _unwrap_msg(msg):
-                if msg.uid not in self.ack_map:
+                if msg.uid not in self.active_workers:
                     # Replies can keep arriving after a client abort; drop them.
                     continue
                 if msg.finished:
+                    self.active_workers.discard(msg.uid)
                     self.continuations.complete(
                         msg.uid, msg.continuation_context, msg.error or msg.continuation_error,
                         finish_reason=msg.finish_reason or "failed",
@@ -1034,22 +1048,42 @@ class FrontendManager:
             asyncio.create_task(self.listen())
             self.initialized = True
 
-    async def send_one(self, msg: BaseTokenizerMsg):
+    async def send_one(self, msg: TTSTokenizeMsg) -> None:
         self._create_listener_once()
-        await self.send_tokenizer.put(msg)
+        self.active_workers.add(msg.uid)
+        try:
+            await asyncio.wait_for(self.send_tokenizer.put(msg), self.worker_timeout)
+        except asyncio.TimeoutError as exc:
+            raise self._timed_out(msg.uid) from exc
+
+    def _timed_out(self, uid: int) -> HTTPException:
+        detail = "Timed out waiting for the TTS worker."
+        self.continuations.complete(uid, None, detail, finish_reason="failed")
+        self._stop_worker(uid)
+        return HTTPException(504, detail, headers={"X-TTS-Generation-Status": "failed"})
+
+    async def _wait_for_reply(self, uid: int, event: asyncio.Event) -> None:
+        try:
+            await asyncio.wait_for(event.wait(), self.worker_timeout)
+        except asyncio.TimeoutError as exc:
+            raise self._timed_out(uid) from exc
+
+    @staticmethod
+    def _worker_rejected(error: str) -> HTTPException:
+        return HTTPException(400, error, headers={"X-TTS-Generation-Status": "failed"})
 
     async def wait_for_tts_start(self, uid: int) -> None:
         """Check the first reply before opening a continuation HTTP stream."""
-        await self.event_map[uid].wait()
+        await self._wait_for_reply(uid, self.event_map[uid])
         error = next((ack.error for ack in self.ack_map[uid] if ack.error), None)
         if error:
-            raise HTTPException(status_code=400, detail=error)
+            raise self._worker_rejected(error)
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
 
         while True:
-            await event.wait()
+            await self._wait_for_reply(uid, event)
             event.clear()
 
             pending = self.ack_map.get(uid)
@@ -1063,7 +1097,7 @@ class FrontendManager:
                     self.ack_map.pop(uid, None)
                     self.event_map.pop(uid, None)
                 if ack.error:
-                    raise HTTPException(status_code=400, detail=ack.error)
+                    raise self._worker_rejected(ack.error)
                 yield ack
             if ack and ack.finished:
                 break
@@ -1074,8 +1108,24 @@ class FrontendManager:
     def abort_user(self, uid: int) -> None:
         self.continuations.abort(uid)
         self.ack_map.pop(uid, None)
-        self.event_map.pop(uid, None)
+        if (event := self.event_map.pop(uid, None)) is not None:
+            event.set()
         self.start_time_map.pop(uid, None)
+        self._stop_worker(uid)
+
+    def _stop_worker(self, uid: int) -> None:
+        if uid in self.active_workers:
+            self.active_workers.discard(uid)
+            if self.config.num_tokenizer == 0:
+                task = asyncio.create_task(self._cancel_worker(uid))
+                self.cancel_tasks.add(task)
+                task.add_done_callback(self.cancel_tasks.discard)
+
+    async def _cancel_worker(self, uid: int) -> None:
+        try:
+            await asyncio.wait_for(self.send_tokenizer.put(AbortMsg(uid)), self.worker_timeout)
+        except Exception:
+            logger.warning("Could not send cancellation to TTS worker for uid=%d", uid)
 
     async def stream_tts_audio(self, uid: int, fade_out_ms: float = 0.0):
         """Stream TTS audio chunks as raw PCM bytes.
@@ -1146,8 +1196,32 @@ class FrontendManager:
         return audio_data, finish_reason
 
     def shutdown(self):
+        for task in self.cancel_tasks:
+            task.cancel()
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
+
+
+_T = TypeVar("_T")
+
+
+async def _until_disconnect(work: Coroutine[Any, Any, _T], receive: Receive) -> _T:
+    async def watch() -> None:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+
+    task = asyncio.create_task(work)
+    watcher = asyncio.create_task(watch())
+    try:
+        await asyncio.wait((task, watcher), return_when=asyncio.FIRST_COMPLETED)
+        if task.done():
+            return task.result()
+        watcher.result()
+        raise ClientDisconnect()
+    finally:
+        for pending in (task, watcher):
+            pending.cancel()
+        await asyncio.gather(task, watcher, return_exceptions=True)
 
 
 class _TTSStreamingResponse(StreamingResponse):
@@ -1157,31 +1231,59 @@ class _TTSStreamingResponse(StreamingResponse):
         uid: int,
         headers: Mapping[str, str],
         *,
-        wait_for_start: bool = False,
         fade_out_ms: float = 0.0,
     ) -> None:
         self._state = state
         self._uid = uid
-        self._wait_for_start = wait_for_start
+        self._has_status = "X-TTS-Continuation-Status-URL" in headers
+        self._status_headers = {
+            key: value for key, value in headers.items() if key.startswith("X-TTS-Continuation-")
+        }
+        self._audio = state.stream_tts_audio(uid, fade_out_ms=fade_out_ms)
         super().__init__(
-            state.stream_tts_audio(uid, fade_out_ms=fade_out_ms),
+            self._stream_with_status(),
             media_type="audio/pcm",
             headers=headers,
         )
 
+    async def _stream_with_status(self):
+        try:
+            async for chunk in self._audio:
+                yield chunk
+        except HTTPException as exc:
+            if not self._has_status:
+                # The status code can't change once PCM has started. With no
+                # status URL, break the HTTP body rather than signal success.
+                raise RuntimeError(f"TTS stream failed: {exc.detail}") from exc
+
     async def stream_response(self, send: Send) -> None:
-        # Wait before sending headers so a prompt error still returns HTTP 400.
-        # On ASGI 2.3 this wait runs alongside Starlette's disconnect listener.
-        if self._wait_for_start:
+        # Convert a worker error before headers to an ordinary JSON error response.
+        try:
             await self._state.wait_for_tts_start(self._uid)
+        except HTTPException as exc:
+            response = JSONResponse(
+                {"detail": exc.detail}, status_code=exc.status_code,
+                headers={**self._status_headers, **(exc.headers or {})},
+            )
+            await send({"type": "http.response.start", "status": response.status_code,
+                        "headers": response.raw_headers})
+            await send({"type": "http.response.body", "body": response.body})
+            return
         await super().stream_response(send)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            # Also watch receive on ASGI 2.4+: there may not be another write
+            # to notice a disconnect while we wait on a worker.
+            await _until_disconnect(self.stream_response(send), receive)
+        except ClientDisconnect:
+            pass
+        except OSError as exc:
+            raise ClientDisconnect() from exc
         finally:
             # The body iterator can be suspended or never started on disconnect.
             self._state.abort_user(self._uid)
+            await self._audio.aclose()
 
 
 @asynccontextmanager
@@ -1330,6 +1432,9 @@ async def _submit_tts_generation(
         "X-Audio-Format": "float32",
     }
     try:
+        if req.continuation_of is not None:
+            assert session_id is not None
+            state.continuations.hold_parent(msg.uid, req.continuation_of, session_id)
         if msg.retain_continuation:
             assert session_id is not None
             continuation_id = state.continuations.reserve(session_id, msg)
@@ -1347,12 +1452,10 @@ async def _submit_tts_generation(
         raise
 
     if req.stream:
-
         return _TTSStreamingResponse(
             state,
             msg.uid,
             headers,
-            wait_for_start=msg.retain_continuation or msg.continuation_context is not None,
             fade_out_ms=req.fade_out_ms,
         )
     try:
@@ -1385,10 +1488,23 @@ async def tts_continuation_status(
 
 
 @app.post("/tts/generate")
+async def _tts_generate_http(
+    req: TTSGenerateRequest,
+    request: Request,
+    x_tts_session_id: str | None = Header(default=None, alias="X-TTS-Session-ID"),
+) -> Response:
+    if req.stream:
+        return await tts_generate(req, x_tts_session_id)
+    try:
+        return await _until_disconnect(tts_generate(req, x_tts_session_id), request.receive)
+    except ClientDisconnect:
+        return Response(status_code=499)  # No client is left to receive it.
+
+
 async def tts_generate(
     req: TTSGenerateRequest,
-    x_tts_session_id: str | None = Header(default=None, alias="X-TTS-Session-ID"),
-):
+    x_tts_session_id: str | None = None,
+) -> Response:
     """Simple TTS generation endpoint."""
     logger.debug("Received TTS generate request: %s", req.text[:50])
     state = get_global_state()
@@ -1401,10 +1517,21 @@ async def tts_generate(
         if state.config.num_tokenizer != 0:
             raise HTTPException(
                 status_code=400,
-                detail="Continuation PoC requires --num-tokenizer 0 (shared tokenizer).",
+                detail="Continuation requires --num-tokenizer 0 (shared tokenizer).",
             )
         if not req.text.strip():
             raise HTTPException(status_code=400, detail="Continuation text must not be empty.")
+        if (
+            req.retain_continuation and req.continuation_of is None
+            and req.long_form_window_chunks == 1 and not req.long_form_pin_anchor
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "To retain continuation context, enable long_form_pin_anchor "
+                    "or set long_form_window_chunks to at least 2."
+                ),
+            )
     if req.continuation_of is not None:
         assert session_id is not None
         try:

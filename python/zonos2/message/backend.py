@@ -6,6 +6,7 @@ from typing import Dict
 # Import TTS message classes so they're available in globals() for deserialization
 from .tts import (  # noqa: F401
     BatchTTSBackendMsg,
+    TTSCancelMsg,
     TTSSamplingParams,
     TTSUserMsg,
 )

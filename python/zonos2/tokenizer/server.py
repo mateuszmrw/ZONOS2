@@ -20,7 +20,13 @@ from zonos2.message import (
     TTSTokenizeMsg,
     TTSUserMsg,
 )
-from zonos2.message.tts import TTSContinuationContext, TTSFinishReason, TTSSamplingParams
+from zonos2.message.tokenizer import AbortMsg
+from zonos2.message.tts import (
+    TTSCancelMsg,
+    TTSContinuationContext,
+    TTSFinishReason,
+    TTSSamplingParams,
+)
 from zonos2.tts.longform import (
     build_continuation_prompt,
     context_chunks,
@@ -135,6 +141,7 @@ def tokenize_worker(
     quality_features: List[str] | None = None,
     speaker_background_num_buckets: int = 0,
     accurate_mode_num_buckets: int = 0,
+    shared: bool = True,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
@@ -174,6 +181,9 @@ def tokenize_worker(
 
     # ----- Long-form (windowed teacher-forced continuation) support -----
     longform_states: dict[int, _LongFormState] = {}
+    # In shared mode this worker sees both the prompt and every frame. Tracking
+    # live UIDs lets it discard late frames without keeping cancellation tombstones.
+    active_uids: set[int] = set()
     # Frames held back from the vocoder while streaming a chunk so the EOA
     # countdown / end-of-content frames are never decoded before we know the trim
     # point. Must be >= (total - eos_frame) + boundary trim so streamed frames
@@ -309,7 +319,18 @@ def tokenize_worker(
 
             logger.debug(f"Received {len(pending_msg)} messages")
 
-            tts_tokenize_msg = [m for m in pending_msg if isinstance(m, TTSTokenizeMsg)]
+            aborted = {m.uid for m in pending_msg if isinstance(m, AbortMsg)} if shared else set()
+            for uid in aborted:
+                active_uids.discard(uid)
+                longform_states.pop(uid, None)
+                tts_vocoder_manager.reset(uid)
+                # Prompt submissions and cancellations use the same push socket,
+                # so this also cancels already submitted internal chunks.
+                send_backend.put(TTSCancelMsg(uid))
+
+            tts_tokenize_msg = [
+                m for m in pending_msg if isinstance(m, TTSTokenizeMsg) and m.uid not in aborted
+            ]
             tts_detokenize_msg = [
                 m for m in pending_msg if isinstance(m, TTSDetokenizeMsg)
             ]
@@ -375,13 +396,16 @@ def tokenize_worker(
                         except ValueError as exc:
                             send_frontend.put(
                                 TTSAudioReply(
-                                    uid=msg.uid, audio_data=b"", finished=True, error=str(exc)
+                                    uid=msg.uid, audio_data=b"", finished=True, error=str(exc),
+                                    finish_reason="failed",
                                 )
                             )
                             continue
                         if previous is not None and previous.history_codes:
                             tts_vocoder_manager.prime(msg.uid, previous.history_codes[-1])
                         longform_states[msg.uid] = state
+                        if shared:
+                            active_uids.add(msg.uid)
                         logger.debug(
                             "Long-form uid=%d chunks=%d context=%d text='%s...'",
                             msg.uid,
@@ -427,6 +451,8 @@ def tokenize_worker(
                             accurate_mode=msg.accurate_mode,
                         )
                     )
+                    if shared:
+                        active_uids.add(msg.uid)
                 if user_msgs:
                     batch_output = BatchTTSBackendMsg(data=user_msgs)
                     if len(batch_output.data) == 1:
@@ -440,9 +466,22 @@ def tokenize_worker(
                 backend_submits: List[TTSUserMsg] = []
 
                 for msg in tts_detokenize_msg:
+                    if shared and msg.uid not in active_uids:
+                        continue
+                    if msg.error:
+                        active_uids.discard(msg.uid)
+                        longform_states.pop(msg.uid, None)
+                        tts_vocoder_manager.reset(msg.uid)
+                        replies.append(TTSAudioReply(
+                            uid=msg.uid, audio_data=b"", finished=True, error=msg.error,
+                            finish_reason="failed",
+                        ))
+                        continue
                     current_state = longform_states.get(msg.uid)
                     if current_state is None:
                         normal_msgs.append(msg)
+                        if msg.finished:
+                            active_uids.discard(msg.uid)
                         continue
                     state = current_state
 
@@ -486,7 +525,7 @@ def tokenize_worker(
                     # delayed codebooks. Do not play or retain those rows.
                     lookahead = (
                         state.raw[len(kept):len(kept) + n_codebooks - 1]
-                        if is_last and usable else []
+                        if is_last else []
                     )
                     audio = _vocode(msg.uid, new, finished=is_last, final_lookahead=lookahead)
                     if usable:
@@ -508,17 +547,20 @@ def tokenize_worker(
                             )
                         )
                     if is_last:
+                        active_uids.discard(msg.uid)
                         longform_states.pop(msg.uid, None)
                     else:
                         state = replace(state, index=state.index + 1, raw=[], committed=0)
                         try:
                             next_msg = _build_chunk_user_msg(state, msg.uid)
                         except ValueError as exc:
+                            active_uids.discard(msg.uid)
                             longform_states.pop(msg.uid, None)
                             tts_vocoder_manager.reset(msg.uid)
                             replies.append(
                                 TTSAudioReply(
-                                    uid=msg.uid, audio_data=b"", finished=True, error=str(exc)
+                                    uid=msg.uid, audio_data=b"", finished=True, error=str(exc),
+                                    finish_reason="failed",
                                 )
                             )
                         else:

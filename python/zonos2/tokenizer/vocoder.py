@@ -239,10 +239,10 @@ class TTSVocoderManager:
         decoded = self._decoded_counts[uid]
         total = len(buffer)
 
-        if is_final:
-            target_frames = total
-        else:
-            target_frames = total - (self.n_codebooks - 1)
+        delay = self.n_codebooks - 1
+        # Even on a final flush, decode only frames with all delayed codes.
+        # Lookahead can supply missing columns, but never adds output frames.
+        target_frames = min(total, max(0, total + len(lookahead) - delay))
         if uid in self._eos_frames:
             target_frames = min(target_frames, self._eos_frames[uid])
 
@@ -256,7 +256,7 @@ class TTSVocoderManager:
 
         # --- Raw slice including overlap context for shear_up ---
         decode_start = decoded - overlap
-        raw_end = target_frames + self.n_codebooks - 1
+        raw_end = target_frames + delay
         raw_slice: Sequence[Sequence[int]] = buffer[decode_start:raw_end]
         if raw_end > total and lookahead:
             raw_slice = [*raw_slice, *lookahead[:raw_end - total]]

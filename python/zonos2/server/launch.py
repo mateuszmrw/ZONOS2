@@ -82,6 +82,7 @@ def launch_server(run_shell: bool = False) -> None:
             "backend_addr": server_args.zmq_backend_addr,
             "frontend_addr": server_args.zmq_frontend_addr,
             "local_bs": 1,
+            "shared": server_args.share_tokenizer,
             "ack_queue": ack_queue,
             "n_codebooks": server_args.tts_n_codebooks,
             "audio_pad_id": server_args.tts_audio_pad_id,

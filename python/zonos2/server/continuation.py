@@ -1,4 +1,4 @@
-"""Bounded, process-local continuation cache for the single-worker proof of concept."""
+"""Bounded, process-local continuation cache."""
 
 from __future__ import annotations
 
@@ -63,19 +63,28 @@ class ContinuationCache:
         self.config = config
         self._clock = clock
         self._entries: dict[str, _Entry] = {}
+        self._active_parents: dict[int, str] = {}
 
     def _prune(self) -> None:
         now = self._clock()
         self._entries = {
             key: entry for key, entry in self._entries.items() if entry.expires_at > now
         }
+        if self._active_parents:
+            self._active_parents = {
+                uid: key for uid, key in self._active_parents.items() if key in self._entries
+            }
 
     def reserve(self, owner: str, template: TTSTokenizeMsg) -> str:
         self._prune()
         if len(self._entries) >= self.config.max_entries:
-            # Never evict an active generation to admit another one.
+            # Keep pending entries and the parents of in-flight requests.
+            protected = set(self._active_parents.values())
             victim = next(
-                (key for key, entry in self._entries.items() if entry.context or entry.error),
+                (
+                    key for key, entry in self._entries.items()
+                    if key not in protected and entry.finish_reason is not None
+                ),
                 None,
             )
             if victim is None:
@@ -125,6 +134,11 @@ class ContinuationCache:
             )
         return replace(entry.template, continuation_context=entry.context)
 
+    def hold_parent(self, uid: int, key: str, owner: str) -> None:
+        """Protect a usable ID from eviction until the linked request exits."""
+        self.get(key, owner)
+        self._active_parents = {**self._active_parents, uid: key}
+
     def complete(
         self,
         uid: int,
@@ -141,7 +155,9 @@ class ContinuationCache:
             text_bytes = len(context.anchor_text.encode("utf-8")) + sum(
                 len(text.encode("utf-8")) for text in context.history_text
             )
-            if frames > self.config.max_frames or text_bytes > self.config.max_text_bytes:
+            if frames == 0:
+                context = None
+            elif frames > self.config.max_frames or text_bytes > self.config.max_text_bytes:
                 context = None
                 error = "Continuation context exceeds the cache limit. Use smaller chunks."
         if context is None and error is None:
@@ -162,6 +178,10 @@ class ContinuationCache:
         }
 
     def abort(self, uid: int) -> None:
+        if uid in self._active_parents:
+            self._active_parents = {
+                child: key for child, key in self._active_parents.items() if child != uid
+            }
         self._entries = {
             key: entry
             for key, entry in self._entries.items()

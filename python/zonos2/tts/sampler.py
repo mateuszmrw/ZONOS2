@@ -12,28 +12,27 @@ logger = init_logger(__name__)
 EOA_TOKEN = 1024  # End of audio token
 
 
-def apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
+def _apply_top_p(probs: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
     """Apply nucleus (top-p) sampling to probabilities."""
-    if p <= 0.0 or p >= 1.0:
+    enabled = (thresholds > 0) & (thresholds < 1)
+    if not bool(enabled.any()):
         return probs
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
+    mask = enabled & (probs_sum - probs_sort > thresholds)
     probs_sort = probs_sort.masked_fill(mask, 0.0)
-    probs = probs.scatter(-1, probs_idx, probs_sort)
-    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    return probs
+    filtered = probs.scatter(-1, probs_idx, probs_sort)
+    return torch.where(enabled, filtered / filtered.sum(dim=-1, keepdim=True).clamp(min=1e-8), probs)
 
 
-def apply_min_p(probs: torch.Tensor, min_p: float) -> torch.Tensor:
+def _apply_min_p(probs: torch.Tensor, thresholds: torch.Tensor) -> torch.Tensor:
     """Apply min-p filtering to probabilities."""
-    if min_p <= 0.0:
+    enabled = thresholds > 0
+    if not bool(enabled.any()):
         return probs
     top_probs, _ = probs.max(dim=-1, keepdim=True)
-    tokens_to_remove = probs < (min_p * top_probs)
-    probs = probs.masked_fill(tokens_to_remove, 0.0)
-    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    return probs
+    filtered = probs.masked_fill(probs < (thresholds * top_probs), 0.0)
+    return torch.where(enabled, filtered / filtered.sum(dim=-1, keepdim=True).clamp(min=1e-8), probs)
 
 
 def apply_repetition_penalty(
@@ -135,7 +134,7 @@ def sample_tts(
     if (logger.isEnabledFor(logging.DEBUG)
             and _debug_sample_count < 10
             and EOA_TOKEN < V
-            and not torch.cuda.is_current_stream_capturing()):
+            and not (logits.is_cuda and torch.cuda.is_current_stream_capturing())):
         _debug_sample_count += 1
         step = _debug_sample_count
 
@@ -168,66 +167,44 @@ def sample_tts(
         repetition_penalties=repetition_penalties,
     )
 
-    # Check if all greedy (temperature <= 0)
-    if (temperatures <= 0).all():
+    greedy = (temperatures <= 0).tolist()
+    if all(greedy):
         next_ids = torch.argmax(logits, dim=-1)
     else:
-        # Per-sequence temperature scaling: (B,) -> (B, 1, 1) for broadcasting
         temp_broadcast = temperatures.view(B, 1, 1).clamp(min=1e-8)
-        logits = logits / temp_broadcast
-        logits_flat = logits.view(B * C, V)
+        scaled = logits / temp_broadcast
+        # One topk operation, with a separate threshold for each request.
+        ks = torch.where((top_ks > 0) & (top_ks < V), top_ks, 0)
+        largest_k = int(ks.max().item())
+        if largest_k:
+            values = torch.topk(scaled, largest_k, dim=-1).values
+            indices = (ks.long().view(B, 1, 1) - 1).clamp_min(0).expand(B, C, 1)
+            kth = values.gather(-1, indices)
+            scaled = scaled.masked_fill((ks.view(B, 1, 1) > 0) & (scaled < kth), -torch.inf)
 
-        # Use min top_k across batch for efficient single topk call
-        top_k = int(top_ks.min().item())
-        if 0 < top_k < V:
-            values, _ = torch.topk(logits_flat, top_k, dim=-1)
-            kth = values[..., -1].unsqueeze(-1)
-            mask = logits_flat < kth
-            logits_flat = logits_flat.masked_fill(mask, float("-inf"))
-
-        probs = F.softmax(logits_flat, dim=-1)
-
-        # Apply top_p (use max across batch - more restrictive)
-        top_p = float(top_ps.max().item())
-        if 0.0 < top_p < 1.0:
-            probs = apply_top_p(probs, top_p)
-
-        # Apply min_p (use max across batch - more restrictive)
-        min_p = float(min_ps.max().item())
-        if min_p > 0.0:
-            probs = apply_min_p(probs, min_p)
+        probs = F.softmax(scaled, dim=-1)
+        probs = _apply_top_p(probs, top_ps.view(B, 1, 1))
+        probs = _apply_min_p(probs, min_ps.view(B, 1, 1))
 
         # An aggressive min_p (>1) or top_p can remove every token in a row,
         # leaving an all-zero distribution. torch.multinomial would then raise a
         # CUDA device-side assert that aborts the scheduler, so fall back to
         # greedy (argmax) for any fully-masked row.
-        invalid_rows = probs.sum(dim=-1) <= 0
+        invalid_rows = ~(probs.sum(dim=-1) > 0)
         if bool(invalid_rows.any()):
-            greedy = logits_flat.argmax(dim=-1)
-            fallback = torch.zeros_like(probs)
-            fallback.scatter_(-1, greedy.unsqueeze(-1), 1.0)
+            fallback = torch.zeros_like(probs).scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
             probs = torch.where(invalid_rows.unsqueeze(-1), fallback, probs)
 
         # Use per-request generators for deterministic sampling when seeds are set
-        has_generators = generators and any(g is not None for g in generators)
-        if has_generators and B == 1 and generators[0] is not None:
-            # Fast path: single request with a generator
-            next_ids = torch.multinomial(
-                probs, num_samples=1, generator=generators[0]
-            ).view(B, C)
-        elif has_generators:
-            # Batched with mixed generators: sample per-row
-            # probs is (B*C, V), each request owns C consecutive rows
+        if any(greedy) or (generators and any(g is not None for g in generators)):
             rows = []
             for i in range(B):
-                row_probs = probs[i * C : (i + 1) * C]  # (C, V)
-                gen = generators[i] if i < len(generators) else None
-                rows.append(
-                    torch.multinomial(row_probs, num_samples=1, generator=gen)
-                )
-            next_ids = torch.cat(rows, dim=0).view(B, C)
+                gen = generators[i] if generators and i < len(generators) else None
+                rows.append(logits[i].argmax(dim=-1) if greedy[i] else
+                            torch.multinomial(probs[i], num_samples=1, generator=gen).squeeze(-1))
+            next_ids = torch.stack(rows)
         else:
-            next_ids = torch.multinomial(probs, num_samples=1).view(B, C)
+            next_ids = torch.multinomial(probs.view(B * C, V), num_samples=1).view(B, C)
 
     # Return unpacked format: list of (audio codes + text placeholder)
     next_ids_list = next_ids.tolist()
@@ -235,7 +212,7 @@ def sample_tts(
     # Debug: print sampled tokens for first 10 samples
     if (logger.isEnabledFor(logging.DEBUG)
             and _debug_sample_count <= 10
-            and not torch.cuda.is_current_stream_capturing()):
+            and not (logits.is_cuda and torch.cuda.is_current_stream_capturing())):
         step = _debug_sample_count
         sampled = next_ids_list[0] if next_ids_list else []
         logger.debug("Step %d sampled: %s", step, sampled)

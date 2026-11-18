@@ -55,13 +55,14 @@ def _shard_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
             shard_state_dict[key] = value.chunk(n, dim=0)[r]
         elif any(key.count(sub) for sub in split_dim_1):
             shard_state_dict[key] = value.chunk(n, dim=1)[r]
-        elif key.count("embedders") or key.count("multi_output"):
+        elif ".embedders." in key:
             num_embeddings = value.shape[0]
             num_embeddings_per_partition = divide_up(num_embeddings, n)
             vocab_start_idx = r * num_embeddings_per_partition
             vocab_end_idx = min((r + 1) * num_embeddings_per_partition, num_embeddings)
             shard_state_dict[key] = value[vocab_start_idx:vocab_end_idx, :]
         else:
+            # MultiOutputHead is replicated; each rank expects the full weight.
             shard_state_dict[key] = value
     return shard_state_dict
 

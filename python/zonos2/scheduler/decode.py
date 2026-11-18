@@ -31,7 +31,8 @@ class TTSDecodeManager:
         """Schedule the next decode batch."""
         if not self.runnable:
             return None
-        return TTSBatch(reqs=list(self.running_reqs), phase="decode")
+        # All tensor-parallel ranks must process the same request in each row.
+        return TTSBatch(reqs=sorted(self.running_reqs, key=lambda r: r.table_idx), phase="decode")
 
     @property
     def runnable(self) -> bool:

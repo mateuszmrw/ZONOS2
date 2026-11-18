@@ -77,10 +77,12 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config)
 
-        # Log expected shapes before loading (for debugging dimension mismatches)
-        logger.info_rank0(f"Model config: num_kv_heads={config.model_config.num_kv_heads}, head_dim={config.model_config.head_dim}")
-        expected_kv_dim = config.model_config.num_kv_heads * config.model_config.head_dim
-        logger.info_rank0(f"Expected kv_dim per TP rank: {expected_kv_dim}")
+        # The loader shards the checkpoint before we validate its dimensions.
+        kv_heads = self.model_config.num_kv_heads
+        head_dim = self.model_config.head_dim
+        local_kv_heads = divide_even(kv_heads, config.tp_info.size)
+        expected_kv_dim = local_kv_heads * head_dim
+        logger.info_rank0("Expected KV size per rank: %d heads x %d", local_kv_heads, head_dim)
 
         state_dict = self._load_weight_state_dict(config)
         self._check_speaker_lda_weights(state_dict)
@@ -105,13 +107,11 @@ class Engine:
                 else:
                     actual_kv_dim = tensor.shape[0] // 2
                 if actual_kv_dim != expected_kv_dim:
-                    inferred_kv_heads = actual_kv_dim // config.model_config.head_dim
                     raise ValueError(
-                        f"KV dimension mismatch for {key}: checkpoint has kv_dim={actual_kv_dim} "
-                        f"(implying n_kv_heads={inferred_kv_heads}), but config expects "
-                        f"kv_dim={expected_kv_dim} (n_kv_heads={config.model_config.num_kv_heads}). "
-                        f"Please ensure your checkpoint's params.json has the correct n_kv_heads value "
-                        f"matching the trained model weights."
+                        f"KV dimension mismatch for {key}: rank {config.tp_info.rank} has "
+                        f"kv_dim={actual_kv_dim}, expected {expected_kv_dim} "
+                        f"({local_kv_heads} of {kv_heads} heads). "
+                        "Check that n_kv_heads in params.json matches the checkpoint."
                     )
                 break  # Only need to check one layer
 

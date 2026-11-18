@@ -19,6 +19,7 @@ from zonos2.message import (
     TTSDetokenizeMsg,
     TTSUserMsg,
 )
+from zonos2.message.tts import TTSCancelMsg
 from zonos2.utils import init_logger
 
 from .cache import CacheManager
@@ -258,6 +259,7 @@ class TTSScheduler(SchedulerIOMixin):
         )
 
         max_seq_len = self.engine.max_seq_len
+        ongoing_reqs = set(ongoing_data[0].batch.reqs) if ongoing_data else set()
         for i, req in enumerate(batch.reqs):
             if req in self.finished_reqs:
                 continue
@@ -275,11 +277,16 @@ class TTSScheduler(SchedulerIOMixin):
                 continue
 
             # Log progress
-            generated = req.total_generated
+            # Overlap can already have advanced the device length by one frame.
+            # EOS and the frame cap apply to the result we're returning now.
+            steps_ahead = int(req in ongoing_reqs)
+            generated = req.total_generated - steps_ahead
             if generated <= 5:
                 logger.debug("TTS %d frame %d: audio_codes=%s", req.uid, generated, audio_codes)
 
-            finish_reason = req.update_finish_reason(audio_codes, max_seq_len)
+            finish_reason = req.update_finish_reason(
+                audio_codes, max_seq_len, steps_ahead=steps_ahead,
+            )
             finished = finish_reason is not None
             if finish_reason == "complete":
                 logger.debug(
@@ -312,9 +319,12 @@ class TTSScheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req.cfg_twin)
                 logger.debug("TTS %d finished: %d frames generated", req.uid, generated)
 
-        # Free resources for finished but not ongoing reqs
-        ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
-        for req in self.finished_reqs.difference(ongoing_reqs):
+        self._release_finished(ongoing_reqs)
+        self.send_result(reply)
+
+    def _release_finished(self, ongoing_reqs: set[TTSReq]) -> None:
+        # Free resources for finished but not ongoing reqs, in stable rank order.
+        for req in sorted(self.finished_reqs.difference(ongoing_reqs), key=lambda r: r.table_idx):
             # Free the allocated cache slots (cached_len represents actually allocated positions)
             slots = self.page_table[req.table_idx, : req.cached_len]
             self.cache_manager.free_slots(slots)
@@ -322,23 +332,45 @@ class TTSScheduler(SchedulerIOMixin):
             self.table_manager.free(req.table_idx)
 
         self.finished_reqs.intersection_update(ongoing_reqs)
-        self.send_result(reply)
 
-    def _process_one_msg(self, msg: BaseTTSBackendMsg) -> None:
+    def _reject(self, uid: int, error: str) -> None:
+        logger.warning_rank0("TTS request %d rejected: %s", uid, error)
+        self.send_result(BatchTTSTokenizerMsg([
+            TTSDetokenizeMsg(uid, [], finished=True, finish_reason="failed", error=error),
+        ]))
+
+    def _cancel(self, uid: int, last_data: TTSForwardData | None) -> None:
+        queued = any(req.uid == uid for req in self.waiting_reqs)
+        self.waiting_reqs = [req for req in self.waiting_reqs if req.uid != uid]
+        running = self.decode_manager.running_reqs
+        # A request or its CFG twin might already be out of the decode set but
+        # still own resources in the preceding overlapping forward pass.
+        candidates = running.union(last_data[0].batch.reqs) if last_data else running
+        cancelled = {req for req in candidates if req.uid == uid}
+        for req in cancelled:
+            self.decode_manager.remove_req(req)
+        # _process_last_data releases the slots after the GPU event, once only.
+        self.finished_reqs.update(cancelled)
+        if queued or cancelled:
+            logger.info_rank0("TTS request %d cancelled", uid)
+
+    def _process_one_msg(
+        self, msg: BaseTTSBackendMsg, last_data: TTSForwardData | None = None,
+    ) -> None:
         if isinstance(msg, BatchTTSBackendMsg):
             for m in msg.data:
-                self._process_one_msg(m)
+                self._process_one_msg(m, last_data)
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
+        elif isinstance(msg, TTSCancelMsg):
+            self._cancel(msg.uid, last_data)
         elif isinstance(msg, TTSUserMsg):
             logger.debug_rank0("Received TTS user msg: %s", msg.uid)
             input_len = len(msg.input_ids)
             max_seq_len = self.engine.max_seq_len
             if input_len >= max_seq_len:
-                return logger.warning_rank0(
-                    f"TTS input len {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
+                self._reject(msg.uid, "TTS prompt exceeds the model context. Use smaller chunks.")
+                return
             self.waiting_reqs.append(msg)
         else:
             logger.error(f"Unknown TTS message type: {type(msg)}")
@@ -510,10 +542,15 @@ class TTSScheduler(SchedulerIOMixin):
             pair_len = input_len + twin_input_len
             max_seq_len = self.engine.max_seq_len
             if input_len >= max_seq_len or twin_input_len >= max_seq_len:
-                logger.warning_rank0(
-                    f"TTS input len {max(input_len, twin_input_len)} exceeds "
-                    f"{max_seq_len}, request {msg.uid} is dropped."
-                )
+                self._reject(msg.uid, "TTS prompt exceeds the model context. Use smaller chunks.")
+                self.waiting_reqs.pop(0)
+                continue
+            if self.table_manager.capacity < needed_slots:
+                self._reject(msg.uid, "Classifier-free guidance requires two request slots.")
+                self.waiting_reqs.pop(0)
+                continue
+            if pair_len > self.engine.num_pages:
+                self._reject(msg.uid, "TTS prompt exceeds the available KV cache. Use smaller chunks.")
                 self.waiting_reqs.pop(0)
                 continue
 
@@ -705,11 +742,11 @@ class TTSScheduler(SchedulerIOMixin):
                     loaded_tokens,
                 )
 
-    def _write_token_ids(self, input: TTSForwardInput, output: TTSForwardOutput) -> None:
+    def _write_token_ids(self, input: TTSForwardInput, next_tokens: torch.Tensor) -> None:
         """Write generated tokens back to pool."""
         flat_pool = self.token_pool.view(-1, self.frame_width)
         frame_indices = input.write_indices // self.frame_width
-        flat_pool[frame_indices] = output.next_tokens_gpu
+        flat_pool[frame_indices] = next_tokens
 
         # Debug: verify what was written
         if logger.isEnabledFor(logging.DEBUG) and input.batch.size > 0:
@@ -882,22 +919,26 @@ class TTSScheduler(SchedulerIOMixin):
                     logits.mean().item(),
                 )
 
-        # Sample tokens
-        next_tokens = self.tts_sampler.sample_to_tensor(logits, sample_args)
-
-        # Mirror the conditional token onto its uncond twin so both stay in step.
-        self._sync_cfg_twin_tokens(next_tokens, batch)
-
-        # Copy to CPU
-        next_tokens_cpu = torch.empty_like(next_tokens, device="cpu", pin_memory=True)
-        copy_done = torch.cuda.Event()
-        next_tokens_cpu.copy_(next_tokens, non_blocking=True)
-        copy_done.record()
-
-        self._write_token_ids(
-            forward_input,
-            TTSForwardOutput(next_tokens, next_tokens_cpu, copy_done),
+        # Rank 0 alone samples, including for unseeded requests. Share the exact
+        # tokens before updating any rank's KV history or EOS state.
+        next_tokens_cpu = torch.empty(
+            (batch.size, self.frame_width), dtype=torch.int32, device="cpu", pin_memory=True,
         )
+        copy_done = torch.cuda.Event()
+        next_tokens = None
+        if self.tp_info.is_primary():
+            next_tokens = self.tts_sampler.sample_to_tensor(logits, sample_args)
+            self._sync_cfg_twin_tokens(next_tokens, batch)
+            next_tokens_cpu.copy_(next_tokens, non_blocking=True)
+        if self.tp_info.size > 1:
+            if next_tokens is not None:
+                copy_done.record()
+                copy_done.synchronize()
+            self.tp_cpu_group.broadcast(next_tokens_cpu, root=0).wait()
+        if next_tokens is None:
+            next_tokens = next_tokens_cpu.to(self.device, non_blocking=True)
+        self._write_token_ids(forward_input, next_tokens)
+        copy_done.record()
 
         # Mark all requests as available for decode
         for req in batch.reqs:
@@ -915,7 +956,7 @@ class TTSScheduler(SchedulerIOMixin):
         """Main loop with overlapping scheduling and execution."""
         blocking = not (last_data or self.waiting_reqs or self.decode_manager.runnable)
         for msg in self.receive_msg(blocking=blocking):
-            self._process_one_msg(msg)
+            self._process_one_msg(msg, last_data)
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -933,6 +974,7 @@ class TTSScheduler(SchedulerIOMixin):
         blocking = not (self.waiting_reqs or self.decode_manager.runnable)
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        self._release_finished(set())
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None

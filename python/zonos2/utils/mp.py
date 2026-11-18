@@ -47,7 +47,7 @@ class ZmqAsyncPushQueue(Generic[T]):
         await self.socket.send(event, copy=False)
 
     def stop(self):
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
 
 

@@ -39,6 +39,10 @@ class TTSTableManager:
         """Number of available request slots."""
         return len(self._free_slots)
 
+    @property
+    def capacity(self) -> int:
+        return self._max_running_reqs
+
     def allocate(self) -> int:
         """Allocate a table slot for a new request."""
         return self._free_slots.pop()

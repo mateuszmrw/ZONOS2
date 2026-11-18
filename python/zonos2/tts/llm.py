@@ -417,6 +417,8 @@ class TTSLLM(TTSScheduler):
         """Process results from the scheduler."""
         for msg in reply.data:
             assert isinstance(msg, TTSDetokenizeMsg)
+            if msg.error:
+                raise ValueError(msg.error)
             status = self.status_map[msg.uid]
 
             if not msg.finished:

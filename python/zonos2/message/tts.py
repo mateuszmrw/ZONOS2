@@ -141,6 +141,7 @@ class TTSDetokenizeMsg(BaseTTSTokenizerMsg):
     finished: bool
     eos_frame: int | None = None
     finish_reason: TTSFinishReason | None = None  # only set on the terminal frame
+    error: str | None = None  # terminal rejection, with no generated frame
 
 
 @dataclass
@@ -160,6 +161,13 @@ class BatchTTSBackendMsg(BaseTTSBackendMsg):
     """Batch of TTS backend messages."""
 
     data: List[BaseTTSBackendMsg]
+
+
+@dataclass
+class TTSCancelMsg(BaseTTSBackendMsg):
+    """Stop a request on every scheduler rank (Tokenizer -> Scheduler)."""
+
+    uid: int
 
 
 @dataclass

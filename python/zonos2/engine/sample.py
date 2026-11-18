@@ -59,7 +59,7 @@ class TTSSampler:
         params = [r.sampling_params for r in batch.reqs]
 
         MIN_T = 1e-6
-        temps = [max(p.temperature, MIN_T) for p in params]
+        temps = [max(p.temperature, MIN_T) if p.temperature > 0 else 0.0 for p in params]
         top_ks = [p.topk if p.topk >= 1 else self.codebook_size for p in params]
         top_ps = [min(max(p.top_p, 0.0), 1.0) for p in params]
         min_ps = [max(p.min_p, 0.0) for p in params]
