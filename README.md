@@ -253,21 +253,125 @@ If a request saves context, the server turns off the control for trailing silenc
 The server trims three frames from the end of a completed chunk before it saves that chunk.
 It does the same for chunks in the middle of a long-form request.
 
+#### Play separate clips with a pause
+
+A fixed reference is saved text and audio tokens.
+It helps keep the voice consistent across clips.
+Speaking pace and tone can still vary.
+The server does not send the reference audio again.
+
+To make separate clips with the same reference:
+
+1. Generate a short passage in the voice that you want with `retain_continuation: true`.
+2. Make sure that the saved reference is [usable](#completion-and-retry).
+3. Use the same `X-TTS-Session-ID` that you used to save the reference.
+4. Use the original reference ID as `continuation_of` for every clip.
+5. Send the following body to `POST /tts/generate`:
+
+   ```json
+   {
+     "text": "Please have your identity card ready.",
+     "continuation_of": "<reference-id>",
+     "retain_continuation": false,
+     "defer_audio_tail": false,
+     "stream": false
+   }
+   ```
+
+6. Make sure that `X-TTS-Generation-Status` is `complete`.
+7. Save the returned PCM as a WAV file.
+
+Setting `retain_continuation: false` does not remove the original reference from the cache.
+
+Leave out `audio_tail_of` for these clips.
+With a linked tail, a response can start with the ending of the previous clip.
+A pause between responses can interrupt a sentence.
+
+Play each WAV to the end.
+Add the pause in your player.
+If you play the WAV files without a pause, the join can still be audible.
+
 #### Play separate responses as one track
 
-If you have all the text, use one `long_form: true` request. Otherwise:
+The decoder turns audio tokens into sound.
+An audio tail is a saved ending.
+The model uses `continuation_of` for its reference.
+The decoder uses `audio_tail_of` to finish the previous clip with the start of the next clip.
+The two IDs can point to different responses.
 
-1. Set `defer_audio_tail: true` on the first request. The response closes after sending most of the audio. It returns `X-TTS-Audio-Tail-ID` and `X-TTS-Audio-Status-URL`.
-2. On the next request, set `audio_tail_of` to the previous tail ID. The server uses the new audio tokens to finish the old tail. Append this response after the previous one. Set `defer_audio_tail: true` again if more text will follow.
-3. On the last request, leave `defer_audio_tail` off. If you already sent the last text with it on, `POST /tts/audio-tails/{id}/finish` returns the remaining PCM without generating more speech.
+If you have all the text, use one `long_form: true` request.
+If the text arrives in parts, use the same `X-TTS-Session-ID` for generation, status, finish, and delete requests.
+Set `defer_audio_tail: true` on the first request in the track.
+The server holds the ending and returns `X-TTS-Audio-Tail-ID` and `X-TTS-Audio-Status-URL`.
 
-Read the response and check its audio status URL before advancing. `finish_reason: "complete"` says the model finished. `audio_tail_pending: true` means there is a tail to use or finish. `usable` still describes model context, not the tail. For example, a request can keep a tail with `retain_continuation: false`. `/tts/capabilities` reports this feature as `audio_tail_continuation`.
+For each response:
 
-Use `continuation_of` for the model context and `audio_tail_of` for playback order. They can point to different responses. To switch languages, start new model context without `continuation_of`, but still pass `audio_tail_of` to keep the same track. A voice or language change can still be audible.
+1. Read all the PCM.
+2. Make sure that the status at `X-TTS-Audio-Status-URL` reports `finish_reason: "complete"`.
+3. If more text follows, make sure that `audio_tail_pending` is `true`.
+4. Append the PCM to the track.
 
-Use the same `X-TTS-Session-ID` for generation, status, finish, and `DELETE /tts/audio-tails/{id}`. Reusing a tail does not change it. If an attempt fails, discard its audio before retrying the same tail. Do not retry audio that has already played. After accepting the next response or finishing the track, delete the old tail. On interruption, close the active stream and delete the tail without finishing it. Deleting a tail does not delete saved model context.
+On the next request, set `audio_tail_of` to the previous `X-TTS-Audio-Tail-ID`.
+If you use a fixed reference, keep `continuation_of` the same for every request.
+If more text follows that request, set `defer_audio_tail: true`.
+If the request is the last one, set `defer_audio_tail: false`.
+If you kept the last tail, call `POST /tts/audio-tails/{id}/finish`.
+Append the PCM from that call to the track.
 
-Audio tails share the cache's entry and time limits. Tracked audio needs a new cache entry for its status, even when it does not keep model context. These requests do not use `fade_out_ms`. The next request can start before the previous audio finishes playing, but live playback may pause if the next audio arrives too late.
+`usable` describes the model context, not the audio tail.
+You can keep an audio tail with `retain_continuation: false`.
+`/tts/capabilities` reports this feature as `audio_tail_continuation`.
+
+If you switch languages, start a new model context without `continuation_of`.
+Use `audio_tail_of` to keep the same track.
+You can still hear a change in voice or language.
+
+The server does not change a tail when you use it.
+If an attempt fails, discard its audio before you retry with the same tail.
+Do not retry audio that already played.
+
+After you accept the next response or finish the track, delete the old tail with `DELETE /tts/audio-tails/{id}`.
+If playback stops early, close the active stream.
+Delete the tail without finishing it.
+Deleting a tail does not remove the saved model context.
+
+The same cache limits apply to model context and audio tails.
+The server needs a cache entry for audio status even if you do not save model context.
+Do not use `fade_out_ms` on these requests.
+You can send the next request before the previous audio ends.
+If the next audio arrives late, playback can pause.
+
+#### Save separate WAV files without adding a pause
+
+[Make one continuous track](#play-separate-responses-as-one-track) before you split it into files.
+Do not cut at HTTP response boundaries.
+The next response can start with part of an earlier sentence.
+Cut at the end of each sentence instead.
+
+If each linked request generates one sentence, find its cut before you delete its tail:
+
+1. Count all PCM samples from the start of the track through that response.
+2. Call `POST /tts/audio-tails/{id}/finish` with the tail ID from that response.
+3. Make sure that `X-TTS-Generation-Status` is `complete`.
+4. Add the number of samples from `/finish` to the count from step 1.
+
+For example, the first response can send 6,144 samples.
+The server can hold 13,824 more samples in the tail.
+The first WAV then contains 19,968 samples, not 6,144.
+`/finish` does not remove the tail.
+If another sentence follows, do not append the PCM from `/finish`.
+The next linked response supplies that ending.
+
+Use the end of the track as the last cut.
+Save the sections as WAV files without extra silence or fades.
+Keep the sample rate and format of the original track.
+If you join the samples again in order, they match the original track.
+A player can still add a gap when it opens the next file.
+
+If short clips sound stiff, try generating several sentences at a time with the fixed reference.
+Text alignment matches words to times in audio.
+If one request generates several sentences, use an audio editor or text alignment to find the cuts between them.
+The tail gives only the end of the request.
 
 #### Cache limits
 
