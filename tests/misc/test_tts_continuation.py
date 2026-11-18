@@ -8,12 +8,14 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 
+import msgpack  # type: ignore[import-untyped]
 import numpy as np
 import pytest
 import torch
 from fastapi import HTTPException
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
+from httpx import Response as HTTPResponse
 from pydantic import ValidationError
 from starlette.requests import ClientDisconnect
 from starlette.types import Message
@@ -29,7 +31,14 @@ from zonos2.message import (
     TTSTokenizeMsg,
 )
 from zonos2.message.tokenizer import AbortMsg
-from zonos2.message.tts import TTSCancelMsg, TTSContinuationContext, TTSFinishReason, TTSUserMsg
+from zonos2.message.tts import (
+    TTSAudioTail,
+    TTSCancelMsg,
+    TTSContinuationContext,
+    TTSFinishAudioMsg,
+    TTSFinishReason,
+    TTSUserMsg,
+)
 from zonos2.server import api_server
 from zonos2.server.continuation import (
     ContinuationCache,
@@ -58,7 +67,9 @@ def _roundtrip_request(msg: TTSTokenizeMsg) -> TTSTokenizeMsg:
 
 
 def _roundtrip_reply(msg: TTSAudioReply) -> TTSAudioReply:
-    decoded: object = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(cast(Any, msg)))
+    decoded: object = BaseFrontendMsg.decoder(
+        msgpack.unpackb(msgpack.packb(BaseFrontendMsg.encoder(cast(Any, msg))), raw=False)
+    )
     assert isinstance(decoded, TTSAudioReply)
     return decoded
 
@@ -99,6 +110,41 @@ def test_cache_capacity_and_frame_limit() -> None:
     assert replacement != key
     with pytest.raises(ContinuationUnavailable):
         cache.get(key, "owner")
+
+
+def test_audio_tail_cache_protects_active_ids_without_extending_expiry() -> None:
+    now = [0.0]
+    cache = ContinuationCache(
+        ContinuationCacheConfig(ttl_seconds=5, max_entries=1), clock=lambda: now[0],
+    )
+    key = cache.reserve("owner", _template(), retain_model=False, track_audio=True)
+    with pytest.raises(ContinuationUnavailable) as pending:
+        cache.hold_audio_tail(2, key, "owner")
+    assert pending.value.status_code == 409
+    tail = TTSAudioTail([[1] * 9], 0, b"", [[2] * 9 for _ in range(8)])
+    cache.complete(1, None, finish_reason="complete", audio_tail=tail)
+    now[0] = 4.0
+    assert cache.hold_audio_tail(2, key, "owner") == tail
+    with pytest.raises(ContinuationUnavailable) as busy:
+        cache.reserve("other", _template(3))
+    assert busy.value.status_code == 503
+    now[0] = 6.0
+    assert cache.reserve("other", _template(3)) != key
+    with pytest.raises(ContinuationUnavailable) as expired:
+        cache.audio_status(key, "owner")
+    assert expired.value.status_code == 404
+
+
+def test_discard_pending_tail_before_late_worker_reply() -> None:
+    cache = ContinuationCache(ContinuationCacheConfig())
+    key = cache.reserve("owner", _template(), track_audio=True)
+    cache.release_audio_tail(key, "owner")
+    tail = TTSAudioTail([[1] * 9], 0, b"", [[2] * 9 for _ in range(8)])
+    cache.complete(1, _context(), finish_reason="complete", audio_tail=tail)
+    assert cache.status(key, "owner").usable
+    with pytest.raises(ContinuationUnavailable) as discarded:
+        cache.hold_audio_tail(2, key, "owner")
+    assert discarded.value.status_code == 404
 
 
 def test_cache_does_not_mark_empty_context_usable() -> None:
@@ -236,7 +282,9 @@ class _WorkerHarness:
             ) for i in range(40)
         ]))
 
-    def run(self, msg: TTSTokenizeMsg, **worker_options: Any) -> list[TTSAudioReply]:
+    def run(
+        self, msg: TTSTokenizeMsg | TTSFinishAudioMsg, **worker_options: Any,
+    ) -> list[TTSAudioReply]:
         self.replies = []
         self.pending.append(msg)
         tokenizer_server.tokenize_worker(
@@ -381,9 +429,11 @@ def _frontend(
 ) -> api_server.FrontendManager:
     inbox: asyncio.Queue[TTSAudioReply] = incoming if incoming is not None else asyncio.Queue()
 
-    async def send(msg: TTSTokenizeMsg) -> None:
+    async def send(msg: TTSTokenizeMsg | TTSFinishAudioMsg) -> None:
         # Exercise the real cross-process message codecs as well as the worker.
-        decoded = _roundtrip_request(msg)
+        wire = msgpack.packb(BaseTokenizerMsg.encoder(cast(Any, msg)), use_bin_type=True)
+        decoded: object = BaseTokenizerMsg.decoder(msgpack.unpackb(wire, raw=False))
+        assert isinstance(decoded, (TTSTokenizeMsg, TTSFinishAudioMsg))
         for reply in worker.run(decoded):
             await inbox.put(_roundtrip_reply(reply))
 
@@ -488,6 +538,97 @@ def test_http_route_returns_custom_header_and_pcm(monkeypatch: pytest.MonkeyPatc
         assert last.status_code == 200
         assert "X-TTS-Continuation-ID" not in last.headers
         assert len(last.content) == 30 * 512 * 4
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_audio_track_order_is_separate_from_model_branches(
+    monkeypatch: pytest.MonkeyPatch, stream: bool,
+) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    manager = _frontend(monkeypatch, worker)
+    owner = {"X-TTS-Session-ID": "owner"}
+    with TestClient(api_server.app) as client:
+        def generate(text: str, **options: Any) -> HTTPResponse:
+            response = client.post(
+                "/tts/generate", headers=owner, json={"text": text, "stream": stream, **options},
+            )
+            assert response.status_code == 200
+            return response
+
+        a = generate("First.", retain_continuation=True, defer_audio_tail=True)
+        anchor = a.headers["X-TTS-Continuation-ID"]
+        a_tail = a.headers["X-TTS-Audio-Tail-ID"]
+        assert a.content
+        bad_owner = {"X-TTS-Session-ID": "wrong"}
+        status_path = a.headers["X-TTS-Audio-Status-URL"]
+        assert client.get(status_path, headers=bad_owner).status_code == 404
+        assert client.post(status_path + "/finish", headers=bad_owner).status_code == 404
+        assert client.delete(status_path, headers=bad_owner).status_code == 404
+        assert client.get(status_path, headers=owner).json() == {
+            "finish_reason": "complete", "audio_tail_pending": True, "usable": True,
+        }
+        c = generate(
+            "After first.", continuation_of=anchor, audio_tail_of=a_tail,
+            retain_continuation=False, defer_audio_tail=True,
+        )
+        assert "X-TTS-Continuation-ID" not in c.headers
+        assert client.get(c.headers["X-TTS-Audio-Status-URL"], headers=owner).json() == {
+            "finish_reason": "complete", "audio_tail_pending": True, "usable": False,
+        }
+        assert client.delete(status_path, headers=owner).status_code == 204
+        assert client.get(f"/tts/continuations/{anchor}", headers=owner).json()["usable"]
+        b = generate(
+            "Branch from first.", continuation_of=anchor,
+            audio_tail_of=c.headers["X-TTS-Audio-Tail-ID"], defer_audio_tail=True,
+        )
+        d = generate(
+            "Guten Tag.", language="de", retain_continuation=True,
+            audio_tail_of=b.headers["X-TTS-Audio-Tail-ID"], defer_audio_tail=True,
+        )
+        e = generate(
+            "Branch again.", continuation_of=anchor,
+            audio_tail_of=d.headers["X-TTS-Audio-Tail-ID"], defer_audio_tail=True,
+        )
+        final_status = e.headers["X-TTS-Audio-Status-URL"]
+        ending = client.post(final_status + "/finish", headers=owner)
+        assert ending.status_code == 200 and ending.headers["X-TTS-Generation-Status"] == "complete"
+        assert client.post(final_status + "/finish", headers=owner).content == ending.content
+        assert client.delete(final_status, headers=owner).status_code == 204
+        assert client.post(final_status + "/finish", headers=owner).status_code == 404
+        combined = np.frombuffer(
+            b"".join(part.content for part in (a, c, b, d, e, ending)), dtype=np.float32,
+        )
+        assert combined.size == 5 * 27 * 512
+        # The fake decoder is constant per phrase, so each must occupy its exact slot.
+        expected = np.repeat(np.arange(101, 106, dtype=np.float32), 27 * 512)
+        np.testing.assert_allclose(combined, expected, rtol=0, atol=2e-5)
+        assert len(worker.prompts) == 5
+        assert not manager.active_workers
+
+
+def test_failed_track_attempt_can_retry_the_same_audio_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    _frontend(monkeypatch, worker)
+    headers = {"X-TTS-Session-ID": "owner"}
+    with TestClient(api_server.app) as client:
+        a = client.post("/tts/generate", headers=headers, json={
+            "text": "First.", "stream": True, "defer_audio_tail": True,
+        })
+        body = {"text": "Second.", "stream": True, "audio_tail_of": a.headers["X-TTS-Audio-Tail-ID"]}
+        worker.finish_reason = "frame_limit"
+        failed = client.post("/tts/generate", headers=headers, json={**body, "defer_audio_tail": True})
+        assert client.get(failed.headers["X-TTS-Audio-Status-URL"], headers=headers).json() == {
+            "finish_reason": "frame_limit", "audio_tail_pending": False, "usable": False,
+        }
+        assert client.post(
+            failed.headers["X-TTS-Audio-Status-URL"] + "/finish", headers=headers,
+        ).status_code == 409
+        worker.finish_reason = "complete"
+        b = client.post("/tts/generate", headers=headers, json=body)
+        assert client.get(b.headers["X-TTS-Audio-Status-URL"], headers=headers).json() == {
+            "finish_reason": "complete", "audio_tail_pending": False, "usable": False,
+        }
+        assert len(a.content + b.content) == (27 + 30) * 512 * 4
 
 
 def test_http_rejects_retention_without_any_context(monkeypatch: pytest.MonkeyPatch) -> None:

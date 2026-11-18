@@ -32,7 +32,7 @@ from zonos2.message import (
     TTSTokenizeMsg,
 )
 from zonos2.message.tokenizer import AbortMsg
-from zonos2.message.tts import TTSFinishReason
+from zonos2.message.tts import TTSFinishAudioMsg, TTSFinishReason
 from zonos2.tts.audio import (
     _decode_audio_bytes,
     _decode_wav_bytes,
@@ -59,6 +59,7 @@ from zonos2.tts.emotion import (
 from zonos2.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 
 from .continuation import (
+    AudioTailStatus,
     ContinuationCache,
     ContinuationCacheConfig,
     ContinuationStatus,
@@ -884,6 +885,8 @@ class TTSGenerateRequest(BaseModel):
     # context unless retain_continuation is explicitly false (the final request).
     retain_continuation: bool = False
     continuation_of: str | None = Field(default=None, min_length=1, max_length=128)
+    defer_audio_tail: bool = False
+    audio_tail_of: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     language: str = "en_us"
     text_normalization: bool = True
     temperature: float = 1.15
@@ -1039,6 +1042,7 @@ class FrontendManager:
                     self.continuations.complete(
                         msg.uid, msg.continuation_context, msg.error or msg.continuation_error,
                         finish_reason=msg.finish_reason or "failed",
+                        audio_tail=msg.audio_tail,
                     )
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
@@ -1048,7 +1052,7 @@ class FrontendManager:
             asyncio.create_task(self.listen())
             self.initialized = True
 
-    async def send_one(self, msg: TTSTokenizeMsg) -> None:
+    async def send_one(self, msg: TTSTokenizeMsg | TTSFinishAudioMsg) -> None:
         self._create_listener_once()
         self.active_workers.add(msg.uid)
         try:
@@ -1235,9 +1239,12 @@ class _TTSStreamingResponse(StreamingResponse):
     ) -> None:
         self._state = state
         self._uid = uid
-        self._has_status = "X-TTS-Continuation-Status-URL" in headers
+        self._has_status = (
+            "X-TTS-Continuation-Status-URL" in headers or "X-TTS-Audio-Status-URL" in headers
+        )
         self._status_headers = {
-            key: value for key, value in headers.items() if key.startswith("X-TTS-Continuation-")
+            key: value for key, value in headers.items()
+            if key.startswith(("X-TTS-Continuation-", "X-TTS-Audio-"))
         }
         self._audio = state.stream_tts_audio(uid, fade_out_ms=fade_out_ms)
         super().__init__(
@@ -1431,17 +1438,31 @@ async def _submit_tts_generation(
         "X-Audio-Channels": "1",
         "X-Audio-Format": "float32",
     }
+    track_audio = req.defer_audio_tail or req.audio_tail_of is not None
     try:
         if req.continuation_of is not None:
             assert session_id is not None
             state.continuations.hold_parent(msg.uid, req.continuation_of, session_id)
-        if msg.retain_continuation:
+        if req.audio_tail_of is not None:
             assert session_id is not None
-            continuation_id = state.continuations.reserve(session_id, msg)
+            tail = state.continuations.hold_audio_tail(msg.uid, req.audio_tail_of, session_id)
+            msg = replace(msg, audio_tail=tail)
+        if msg.retain_continuation or track_audio:
+            assert session_id is not None
+            key = state.continuations.reserve(
+                session_id, msg, retain_model=msg.retain_continuation, track_audio=track_audio,
+            )
             headers = {
                 **headers,
-                "X-TTS-Continuation-ID": continuation_id,
-                "X-TTS-Continuation-Status-URL": f"/tts/continuations/{continuation_id}",
+                **(
+                    {
+                        "X-TTS-Continuation-ID": key,
+                        "X-TTS-Continuation-Status-URL": f"/tts/continuations/{key}",
+                    }
+                    if msg.retain_continuation else {}
+                ),
+                **({"X-TTS-Audio-Status-URL": f"/tts/audio-tails/{key}"} if track_audio else {}),
+                **({"X-TTS-Audio-Tail-ID": key} if req.defer_audio_tail else {}),
             }
         await state.send_one(msg)
     except ContinuationUnavailable as exc:
@@ -1487,6 +1508,70 @@ async def tts_continuation_status(
     return status
 
 
+def _audio_tail_session(header: str | None) -> str:
+    if not (session_id := _normalize_session_id(header)):
+        raise HTTPException(400, "Audio tails require the X-TTS-Session-ID header.")
+    return session_id
+
+
+@app.get("/tts/audio-tails/{tail_id}")
+async def tts_audio_tail_status(
+    tail_id: str,
+    response: Response,
+    x_tts_session_id: str | None = Header(default=None, alias="X-TTS-Session-ID"),
+) -> AudioTailStatus:
+    session_id = _audio_tail_session(x_tts_session_id)
+    try:
+        status = get_global_state().continuations.audio_status(tail_id, session_id)
+    except ContinuationUnavailable as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    response.headers["Cache-Control"] = "no-store"
+    return status
+
+
+@app.delete("/tts/audio-tails/{tail_id}", status_code=204)
+async def tts_discard_audio_tail(
+    tail_id: str,
+    x_tts_session_id: str | None = Header(default=None, alias="X-TTS-Session-ID"),
+) -> Response:
+    session_id = _audio_tail_session(x_tts_session_id)
+    try:
+        get_global_state().continuations.release_audio_tail(tail_id, session_id)
+    except ContinuationUnavailable as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    return Response(status_code=204)
+
+
+@app.post("/tts/audio-tails/{tail_id}/finish")
+async def tts_finish_audio_tail(
+    tail_id: str,
+    request: Request,
+    x_tts_session_id: str | None = Header(default=None, alias="X-TTS-Session-ID"),
+) -> Response:
+    session_id = _audio_tail_session(x_tts_session_id)
+    state = get_global_state()
+    uid = state.new_user()
+
+    async def flush() -> Response:
+        tail = state.continuations.hold_audio_tail(uid, tail_id, session_id)
+        await state.send_one(TTSFinishAudioMsg(uid, tail))
+        pcm, reason = await state.wait_for_tts_audio(uid)
+        return Response(pcm, media_type="audio/pcm", headers={
+            "X-Audio-Sample-Rate": "44100", "X-Audio-Channels": "1",
+            "X-Audio-Format": "float32", "X-TTS-Generation-Status": reason,
+            "Cache-Control": "no-store",
+        })
+
+    try:
+        return await _until_disconnect(flush(), request.receive)
+    except ContinuationUnavailable as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except ClientDisconnect:
+        return Response(status_code=499)
+    finally:
+        state.abort_user(uid)
+
+
 @app.post("/tts/generate")
 async def _tts_generate_http(
     req: TTSGenerateRequest,
@@ -1509,7 +1594,10 @@ async def tts_generate(
     logger.debug("Received TTS generate request: %s", req.text[:50])
     state = get_global_state()
     session_id = _normalize_session_id(x_tts_session_id)
-    if req.retain_continuation or req.continuation_of is not None:
+    track_audio = req.defer_audio_tail or req.audio_tail_of is not None
+    if track_audio and req.fade_out_ms != 0:
+        raise HTTPException(400, "Audio tail requests do not support fade_out_ms.")
+    if req.retain_continuation or req.continuation_of is not None or track_audio:
         if not session_id:
             raise HTTPException(
                 status_code=400, detail="Continuation requires the X-TTS-Session-ID header."
@@ -1541,7 +1629,8 @@ async def tts_generate(
         supplied = req.model_dump(exclude_unset=True)
         sampling_fields = set(TTSSamplingParams.__dataclass_fields__) & set(supplied)
         allowed = sampling_fields | {
-            "text", "stream", "continuation_of", "retain_continuation", "fade_out_ms"
+            "text", "stream", "continuation_of", "retain_continuation", "fade_out_ms",
+            "audio_tail_of", "defer_audio_tail",
         }
         unsupported = set(supplied) - allowed
         if unsupported:
@@ -1569,6 +1658,7 @@ async def tts_generate(
             sampling_params=replace(parent.sampling_params, **sampling_updates),
             retain_continuation=req.retain_continuation if "retain_continuation" in supplied else True,
             max_prompt_frames=state.config.max_seq_len - 1,
+            defer_audio_tail=req.defer_audio_tail,
         )
         return await _submit_tts_generation(state, msg, req, session_id)
     try:
@@ -1650,7 +1740,8 @@ async def tts_generate(
         long_form_pin_anchor=req.long_form_pin_anchor,
         long_form_split_mode=req.long_form_split_mode,
         retain_continuation=req.retain_continuation,
-        max_prompt_frames=state.config.max_seq_len - 1 if req.retain_continuation else None,
+        max_prompt_frames=state.config.max_seq_len - 1 if req.retain_continuation or track_audio else None,
+        defer_audio_tail=req.defer_audio_tail,
     )
     return await _submit_tts_generation(state, msg, req, session_id)
 
@@ -1784,6 +1875,7 @@ async def tts_capabilities():
     return {
         "text_normalization_enabled": normalization_enabled(),
         "text_norm_languages": list(SERVER_TO_NEMO_LANG),
+        "audio_tail_continuation": state.config.num_tokenizer == 0,
         "speaker_enabled": _model_supports_speaker(state.config),
         "speaker_embedding_dim": _model_speaker_dim(state.config),
         "n_codebooks": int(getattr(state.config.model_config, "n_codebooks", 9)),

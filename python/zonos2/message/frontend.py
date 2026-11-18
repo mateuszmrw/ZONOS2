@@ -7,6 +7,7 @@ from typing import Dict
 from .tts import (  # noqa: F401
     BatchTTSFrontendMsg,
     TTSAudioReply,
+    TTSAudioTail,
     TTSContinuationContext,
 )
 from .utils import deserialize_type, serialize_type

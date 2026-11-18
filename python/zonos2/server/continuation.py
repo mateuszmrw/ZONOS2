@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
-from zonos2.message.tts import TTSContinuationContext, TTSFinishReason, TTSTokenizeMsg
+from zonos2.message.tts import TTSAudioTail, TTSContinuationContext, TTSFinishReason, TTSTokenizeMsg
 
 
 class ContinuationCacheConfig(BaseModel):
@@ -42,14 +42,23 @@ class ContinuationStatus(BaseModel):
     error: str | None = None
 
 
+class AudioTailStatus(BaseModel):
+    finish_reason: TTSFinishReason | None
+    audio_tail_pending: bool
+    usable: bool  # Model context, not audio state.
+
+
 @dataclass(frozen=True)
 class _Entry:
     owner: str
-    template: TTSTokenizeMsg
+    uid: int
+    template: TTSTokenizeMsg | None
     expires_at: float
     context: TTSContinuationContext | None = None
     error: str | None = None
     finish_reason: TTSFinishReason | None = None
+    track_audio: bool = False
+    audio_tail: TTSAudioTail | None = None
 
 
 class ContinuationCache:
@@ -64,6 +73,7 @@ class ContinuationCache:
         self._clock = clock
         self._entries: dict[str, _Entry] = {}
         self._active_parents: dict[int, str] = {}
+        self._active_tails: dict[int, str] = {}
 
     def _prune(self) -> None:
         now = self._clock()
@@ -74,12 +84,19 @@ class ContinuationCache:
             self._active_parents = {
                 uid: key for uid, key in self._active_parents.items() if key in self._entries
             }
+        if self._active_tails:
+            self._active_tails = {
+                uid: key for uid, key in self._active_tails.items() if key in self._entries
+            }
 
-    def reserve(self, owner: str, template: TTSTokenizeMsg) -> str:
+    def reserve(
+        self, owner: str, template: TTSTokenizeMsg, *,
+        retain_model: bool = True, track_audio: bool = False,
+    ) -> str:
         self._prune()
         if len(self._entries) >= self.config.max_entries:
             # Keep pending entries and the parents of in-flight requests.
-            protected = set(self._active_parents.values())
+            protected = set(self._active_parents.values()) | set(self._active_tails.values())
             victim = next(
                 (
                     key for key, entry in self._entries.items()
@@ -95,8 +112,16 @@ class ContinuationCache:
             **self._entries,
             key: _Entry(
                 owner=owner,
-                template=replace(template, text="", continuation_context=None),
+                uid=template.uid,
+                template=(
+                    replace(
+                        template, text="", continuation_context=None,
+                        audio_tail=None, defer_audio_tail=False,
+                    )
+                    if retain_model else None
+                ),
                 expires_at=self._clock() + self.config.ttl_seconds,
+                track_audio=track_audio,
             ),
         }
         return key
@@ -110,6 +135,8 @@ class ContinuationCache:
 
     def status(self, key: str, owner: str) -> ContinuationStatus:
         entry = self._lookup(key, owner)
+        if entry.template is None:
+            raise ContinuationUnavailable("No model context was retained for this ID.")
         usable = entry.context is not None
         status: Literal["pending", "complete", "incomplete", "failed"]
         if usable:
@@ -126,6 +153,8 @@ class ContinuationCache:
 
     def get(self, key: str, owner: str) -> TTSTokenizeMsg:
         entry = self._lookup(key, owner)
+        if entry.template is None:
+            raise ContinuationUnavailable("No model context was retained for this ID.")
         if entry.error:
             raise ContinuationUnavailable(entry.error, 409)
         if entry.context is None:
@@ -133,6 +162,37 @@ class ContinuationCache:
                 "Previous generation is not ready. Finish reading its response.", 409
             )
         return replace(entry.template, continuation_context=entry.context)
+
+    def _audio_entry(self, key: str, owner: str) -> _Entry:
+        entry = self._lookup(key, owner)
+        if not entry.track_audio:
+            raise ContinuationUnavailable("No audio tail was tracked for this ID.")
+        return entry
+
+    def audio_status(self, key: str, owner: str) -> AudioTailStatus:
+        entry = self._audio_entry(key, owner)
+        return AudioTailStatus(
+            finish_reason=entry.finish_reason,
+            audio_tail_pending=entry.audio_tail is not None,
+            usable=entry.context is not None,
+        )
+
+    def hold_audio_tail(self, uid: int, key: str, owner: str) -> TTSAudioTail:
+        entry = self._audio_entry(key, owner)
+        if entry.audio_tail is None:
+            raise ContinuationUnavailable("This audio tail is not ready or was not kept.", 409)
+        self._active_tails = {**self._active_tails, uid: key}
+        return entry.audio_tail
+
+    def release_audio_tail(self, key: str, owner: str) -> None:
+        entry = self._audio_entry(key, owner)
+        if entry.template is not None:
+            # The caller may still want to branch from the model context.
+            self._entries = {
+                **self._entries, key: replace(entry, track_audio=False, audio_tail=None),
+            }
+        else:
+            self._entries = {k: v for k, v in self._entries.items() if k != key}
 
     def hold_parent(self, uid: int, key: str, owner: str) -> None:
         """Protect a usable ID from eviction until the linked request exits."""
@@ -146,6 +206,7 @@ class ContinuationCache:
         error: str | None = None,
         *,
         finish_reason: TTSFinishReason,
+        audio_tail: TTSAudioTail | None = None,
     ) -> None:
         self._prune()
         if finish_reason != "complete" or error is not None:
@@ -166,12 +227,13 @@ class ContinuationCache:
             key: (
                 replace(
                     entry,
-                    context=context,
-                    error=error,
+                    context=context if entry.template is not None else None,
+                    error=error if entry.template is not None else None,
                     finish_reason=finish_reason,
                     expires_at=self._clock() + self.config.ttl_seconds,
+                    audio_tail=audio_tail if entry.track_audio and finish_reason == "complete" else None,
                 )
-                if entry.template.uid == uid
+                if entry.uid == uid
                 else entry
             )
             for key, entry in self._entries.items()
@@ -182,8 +244,12 @@ class ContinuationCache:
             self._active_parents = {
                 child: key for child, key in self._active_parents.items() if child != uid
             }
+        if uid in self._active_tails:
+            self._active_tails = {
+                child: key for child, key in self._active_tails.items() if child != uid
+            }
         self._entries = {
             key: entry
             for key, entry in self._entries.items()
-            if entry.template.uid != uid or entry.context is not None or entry.error is not None
+            if entry.uid != uid or entry.finish_reason is not None
         }

@@ -107,3 +107,44 @@ def test_primed_vocoder_flushes_only_new_samples_across_all_codebooks(
     ]
     np.testing.assert_allclose(pcm, expected, rtol=0, atol=0.001)
     assert manager.finish(uid) == b""
+
+
+@pytest.mark.parametrize("lengths", [(1, 2, 71), (27, 48, 19), (109, 7, 223)])
+def test_deferred_decode_is_identical_to_one_continuous_decode(
+    monkeypatch: pytest.MonkeyPatch, lengths: tuple[int, ...]
+) -> None:
+    def fake_decode(codes: torch.Tensor) -> torch.Tensor:
+        # Use all codebooks and actual neighboring audio frames, like a noncausal decoder.
+        signal = codes.sum(dim=-1).float()
+        padded = torch.nn.functional.pad(signal, (1, 1))
+        return (padded[:, :-2] + 2 * padded[:, 1:-1] + padded[:, 2:]).repeat_interleave(
+            2, dim=1
+        ).cpu()
+
+    monkeypatch.setattr(vocoder, "decode_dac", fake_decode)
+    manager = vocoder.TTSVocoderManager(hop_length=2)
+    rows = [[(17 * i + 19 * j) % 1024 for j in range(9)] for i in range(sum(lengths) + 8)]
+
+    def feed(uid: int, frames: list[list[int]]) -> bytes:
+        return b"".join(manager.decode_frames([TTSDetokenizeMsg(uid, row, False) for row in frames]))
+
+    continuous = feed(0, rows[:-8]) + manager.finish(0, lookahead=rows[-8:])
+    offset = 0
+    parts = []
+    tail = None
+    for uid, length in enumerate(lengths, 1):
+        if tail is not None:
+            manager.resume(uid, tail)
+        parts.append(feed(uid, rows[offset:offset + length]))
+        offset += length
+        tail = manager.suspend(uid, lookahead=rows[offset:offset + 8])
+        assert len(tail.frames) <= manager.overlap_frames + manager.min_decode_chunk + 7
+        assert manager.finish(uid) == b""
+    assert tail is not None
+    # The same tail can be retried on a new UID without advancing the snapshot.
+    manager.resume(10, tail)
+    final = manager.finish(10, lookahead=tail.lookahead)
+    manager.resume(11, tail)
+    assert manager.finish(11, lookahead=tail.lookahead) == final
+    assert b"".join(parts) + final == continuous
+    assert len(continuous) == 4 * 2 * sum(lengths)

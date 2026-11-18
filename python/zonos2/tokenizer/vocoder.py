@@ -8,6 +8,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 from zonos2.message import TTSDetokenizeMsg
+from zonos2.message.tts import TTSAudioTail
 
 # Global DAC model cache
 _dac_model = None
@@ -134,6 +135,30 @@ class TTSVocoderManager:
         self.reset(uid)
         self._frame_buffers = {**self._frame_buffers, uid: prefix}
         self._decoded_counts = {**self._decoded_counts, uid: len(prefix)}
+
+    def suspend(self, uid: int, *, lookahead: Sequence[Sequence[int]]) -> TTSAudioTail:
+        """Save only what the next incremental decode can still use."""
+        decoded = self._decoded_counts[uid]
+        start = max(0, decoded - self.overlap_frames)
+        overlap = self._overlap_tails.get(uid)
+        tail = TTSAudioTail(
+            frames=[list(row) for row in self._frame_buffers[uid][start:]],
+            decoded_frames=decoded - start,
+            overlap_pcm=overlap.tobytes() if overlap is not None else b"",
+            lookahead=[list(row) for row in lookahead],
+        )
+        self.reset(uid)
+        return tail
+
+    def resume(self, uid: int, tail: TTSAudioTail) -> None:
+        """Continue the same decoder timeline without replaying emitted samples."""
+        self.reset(uid)
+        self._frame_buffers = {**self._frame_buffers, uid: [list(row) for row in tail.frames]}
+        self._decoded_counts = {**self._decoded_counts, uid: tail.decoded_frames}
+        if tail.overlap_pcm:
+            self._overlap_tails = {
+                **self._overlap_tails, uid: np.frombuffer(tail.overlap_pcm, dtype=np.float32),
+            }
 
     def decode_frames(
         self,

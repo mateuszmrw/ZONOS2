@@ -75,6 +75,16 @@ class TTSContinuationContext:
     history_codes: List[List[List[int]]]
 
 
+@dataclass(frozen=True)
+class TTSAudioTail:
+    """Bounded decoder checkpoint; independent of the model's prompt context."""
+
+    frames: List[List[int]]
+    decoded_frames: int
+    overlap_pcm: bytes
+    lookahead: List[List[int]]  # Only used when ending the track here.
+
+
 @dataclass
 class TTSTokenizeMsg(BaseTTSTokenizerMsg):
     """Request to build TTS prompt frames from text (Frontend -> Tokenizer)."""
@@ -127,6 +137,14 @@ class TTSTokenizeMsg(BaseTTSTokenizerMsg):
     # The tokenizer rejects an oversized continuation instead of letting the
     # scheduler silently drop it. Leave room for at least one generated frame.
     max_prompt_frames: int | None = None
+    audio_tail: TTSAudioTail | None = None
+    defer_audio_tail: bool = False
+
+
+@dataclass
+class TTSFinishAudioMsg(BaseTTSTokenizerMsg):
+    uid: int
+    audio_tail: TTSAudioTail
 
 
 @dataclass
@@ -234,3 +252,4 @@ class TTSAudioReply(BaseTTSFrontendMsg):
     continuation_error: str | None = None
     error: str | None = None
     finish_reason: TTSFinishReason | None = None  # whole HTTP request, not an intermediate chunk
+    audio_tail: TTSAudioTail | None = None

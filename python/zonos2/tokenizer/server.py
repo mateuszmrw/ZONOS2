@@ -24,6 +24,7 @@ from zonos2.message.tokenizer import AbortMsg
 from zonos2.message.tts import (
     TTSCancelMsg,
     TTSContinuationContext,
+    TTSFinishAudioMsg,
     TTSFinishReason,
     TTSSamplingParams,
 )
@@ -78,10 +79,15 @@ class _LongFormState:
     prior_chunks: int = 0
     retain_continuation: bool = False
     max_prompt_frames: int | None = None
+    defer_audio_tail: bool = False
 
     @property
     def is_last(self) -> bool:
         return self.index == len(self.chunks) - 1
+
+    @property
+    def open_end(self) -> bool:
+        return not self.is_last or self.retain_continuation or self.defer_audio_tail
 
     def accept_chunk(self, kept: List[List[int]]) -> _LongFormState:
         first = self.prior_chunks + self.index == 0
@@ -225,10 +231,7 @@ def tokenize_worker(
         return t
 
     def _build_chunk_user_msg(state: _LongFormState, uid: int) -> TTSUserMsg:
-        q = (
-            state.final_quality
-            if state.is_last and not state.retain_continuation else state.nonfinal_quality
-        )
+        q = state.nonfinal_quality if state.open_end else state.final_quality
         # Whole prior chunks: the rolling recent window plus, when the anchor has
         # scrolled out of it, the pinned first chunk (middle evicted).
         prepend_anchor = (
@@ -328,6 +331,16 @@ def tokenize_worker(
                 # so this also cancels already submitted internal chunks.
                 send_backend.put(TTSCancelMsg(uid))
 
+            for finish in pending_msg:
+                if isinstance(finish, TTSFinishAudioMsg) and finish.uid not in aborted:
+                    tts_vocoder_manager.resume(finish.uid, finish.audio_tail)
+                    audio = tts_vocoder_manager.finish(
+                        finish.uid, lookahead=finish.audio_tail.lookahead,
+                    )
+                    send_frontend.put(TTSAudioReply(
+                        uid=finish.uid, audio_data=audio, finished=True, finish_reason="complete",
+                    ))
+
             tts_tokenize_msg = [
                 m for m in pending_msg if isinstance(m, TTSTokenizeMsg) and m.uid not in aborted
             ]
@@ -356,6 +369,7 @@ def tokenize_worker(
 
                     if (
                         msg.retain_continuation or msg.continuation_context is not None
+                        or msg.defer_audio_tail or msg.audio_tail is not None
                         or (chunks is not None and len(chunks) > 1)
                     ):
                         speaker_slot = (
@@ -380,6 +394,7 @@ def tokenize_worker(
                             pin_anchor=msg.long_form_pin_anchor,
                             retain_continuation=msg.retain_continuation,
                             max_prompt_frames=msg.max_prompt_frames,
+                            defer_audio_tail=msg.defer_audio_tail,
                         )
                         previous = msg.continuation_context
                         if previous is not None:
@@ -401,7 +416,9 @@ def tokenize_worker(
                                 )
                             )
                             continue
-                        if previous is not None and previous.history_codes:
+                        if msg.audio_tail is not None:
+                            tts_vocoder_manager.resume(msg.uid, msg.audio_tail)
+                        elif previous is not None and previous.history_codes:
                             tts_vocoder_manager.prime(msg.uid, previous.history_codes[-1])
                         longform_states[msg.uid] = state
                         if shared:
@@ -508,9 +525,7 @@ def tokenize_worker(
                         state.raw,
                         msg.eos_frame,
                         drop_trailing_frames=(
-                            _LONGFORM_BOUNDARY_TRIM
-                            if complete and (not state.is_last or state.retain_continuation)
-                            else 0
+                            _LONGFORM_BOUNDARY_TRIM if complete and state.open_end else 0
                         ),
                     )
                     usable = complete and bool(kept)
@@ -521,13 +536,15 @@ def tokenize_worker(
                     if is_last and not usable and finish_reason != "frame_limit":
                         finish_reason = "failed"
                     new = kept[state.committed:] if state.committed < len(kept) else []
-                    # The final content frame still needs later rows to align its
-                    # delayed codebooks. Do not play or retain those rows.
-                    lookahead = (
-                        state.raw[len(kept):len(kept) + n_codebooks - 1]
-                        if is_last else []
+                    defer = is_last and usable and state.defer_audio_tail
+                    # Use the next chunk for alignment and DAC context on an open track.
+                    # These extra rows are only a fallback when the caller ends the track here.
+                    lookahead = state.raw[len(kept):len(kept) + n_codebooks - 1] if is_last else []
+                    audio = _vocode(
+                        msg.uid, new, finished=is_last and not defer,
+                        final_lookahead=lookahead if not defer else (),
                     )
-                    audio = _vocode(msg.uid, new, finished=is_last, final_lookahead=lookahead)
+                    tail = tts_vocoder_manager.suspend(msg.uid, lookahead=lookahead) if defer else None
                     if usable:
                         state = state.accept_chunk(kept)
                     if audio or is_last:
@@ -544,6 +561,7 @@ def tokenize_worker(
                                     else None
                                 ),
                                 finish_reason=finish_reason,
+                                audio_tail=tail,
                             )
                         )
                     if is_last:

@@ -253,6 +253,22 @@ If a request saves context, the server turns off the control for trailing silenc
 The server trims three frames from the end of a completed chunk before it saves that chunk.
 It does the same for chunks in the middle of a long-form request.
 
+#### Play separate responses as one track
+
+If you have all the text, use one `long_form: true` request. Otherwise:
+
+1. Set `defer_audio_tail: true` on the first request. The response closes after sending most of the audio. It returns `X-TTS-Audio-Tail-ID` and `X-TTS-Audio-Status-URL`.
+2. On the next request, set `audio_tail_of` to the previous tail ID. The server uses the new audio tokens to finish the old tail. Append this response after the previous one. Set `defer_audio_tail: true` again if more text will follow.
+3. On the last request, leave `defer_audio_tail` off. If you already sent the last text with it on, `POST /tts/audio-tails/{id}/finish` returns the remaining PCM without generating more speech.
+
+Read the response and check its audio status URL before advancing. `finish_reason: "complete"` says the model finished. `audio_tail_pending: true` means there is a tail to use or finish. `usable` still describes model context, not the tail. For example, a request can keep a tail with `retain_continuation: false`. `/tts/capabilities` reports this feature as `audio_tail_continuation`.
+
+Use `continuation_of` for the model context and `audio_tail_of` for playback order. They can point to different responses. To switch languages, start new model context without `continuation_of`, but still pass `audio_tail_of` to keep the same track. A voice or language change can still be audible.
+
+Use the same `X-TTS-Session-ID` for generation, status, finish, and `DELETE /tts/audio-tails/{id}`. Reusing a tail does not change it. If an attempt fails, discard its audio before retrying the same tail. Do not retry audio that has already played. After accepting the next response or finishing the track, delete the old tail. On interruption, close the active stream and delete the tail without finishing it. Deleting a tail does not delete saved model context.
+
+Audio tails share the cache's entry and time limits. Tracked audio needs a new cache entry for its status, even when it does not keep model context. These requests do not use `fade_out_ms`. The next request can start before the previous audio finishes playing, but live playback may pause if the next audio arrives too late.
+
 #### Cache limits
 
 The cache stores context between requests.
@@ -271,7 +287,7 @@ An entry can still expire while a request uses it.
 The server returns HTTP 404 for an unknown ID, an expired ID, or an ID from another session.
 If you try to reuse pending or unusable context, the server returns HTTP 409.
 If a full cache has no entry that the server can remove, a request that saves context returns HTTP 503.
-A linked request with `retain_continuation: false` does not need a new entry.
+A linked request with `retain_continuation: false` does not need a new entry unless it uses the audio track.
 
 #### Completion and retry
 
@@ -317,9 +333,8 @@ A restart clears its IDs. If a session goes to another replica, that replica can
 Start a new chain after a restart or a move. The server cannot recover the old chain.
 The session header does not prove who the caller is. Use a trusted network or add access control in front of the server.
 
-The server decodes each response separately.
-The decoder uses saved audio tokens for the next response without replaying old audio.
-Where two responses meet, the audio can differ from one continuous decode.
+Without an audio track, the server decodes each response separately.
+Where two responses meet, this can cause an audible click.
 
 A cold start is the first render after startup.
 Fixed seeds control which tokens the model selects.
