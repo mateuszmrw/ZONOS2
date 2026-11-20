@@ -8,7 +8,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Coroutine, Mapping
+from collections.abc import AsyncIterator, Coroutine, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -32,7 +32,7 @@ from zonos2.message import (
     TTSTokenizeMsg,
 )
 from zonos2.message.tokenizer import AbortMsg
-from zonos2.message.tts import TTSFinishAudioMsg, TTSFinishReason
+from zonos2.message.tts import TTSContinuationContext, TTSFinishAudioMsg, TTSFinishReason
 from zonos2.tts.audio import (
     _decode_audio_bytes,
     _decode_wav_bytes,
@@ -65,6 +65,7 @@ from .continuation import (
     ContinuationStatus,
     ContinuationUnavailable,
 )
+from .fixed_references import FixedReference, load_fixed_references, select_fixed_reference
 
 if TYPE_CHECKING:
     from zonos2.models.speaker_cloning import Qwen3SpeakerEmbedding
@@ -1017,6 +1018,7 @@ class FrontendManager:
     start_time_map: Dict[int, float] = field(default_factory=dict)
     worker_timeout: float = field(default_factory=_worker_timeout)
     active_workers: set[int] = field(default_factory=set)
+    fixed_references: Mapping[tuple[str, str], FixedReference] = field(default_factory=dict)
     cancel_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     continuations: ContinuationCache = field(
         default_factory=lambda: ContinuationCache(ContinuationCacheConfig.from_env())
@@ -1293,13 +1295,41 @@ class _TTSStreamingResponse(StreamingResponse):
             await self._audio.aclose()
 
 
+async def _load_configured_fixed_references(state: FrontendManager, path: Path) -> None:
+    from zonos2.tokenizer.textnorm import SERVER_TO_NEMO_LANG
+
+    if state.config.num_tokenizer != 0:
+        raise ValueError("Fixed references require --num-tokenizer 0.")
+    model_revision = os.getenv("ZONOS2_MODEL_REVISION")
+    if not model_revision:
+        raise ValueError("Set ZONOS2_MODEL_REVISION when loading fixed references.")
+    speakers = await _list_default_speakers(state.config)
+    state.fixed_references = load_fixed_references(
+        path,
+        model_dir=Path(state.config.model_path),
+        model_revision=model_revision,
+        n_codebooks=state.config.tts_n_codebooks,
+        max_seq_len=state.config.max_seq_len,
+        languages=SERVER_TO_NEMO_LANG,
+        voices=[
+            (speaker.speaker_id, speaker.path)
+            for speaker in speakers
+            if speaker.source_type == "embedding_file"
+        ],
+    )
+    logger.info("Loaded %d fixed TTS references.", len(state.fixed_references))
+
+
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    yield
-    # shutdown code here
-    global _GLOBAL_STATE
-    if _GLOBAL_STATE is not None:
-        _GLOBAL_STATE.shutdown()
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        reference_file = os.getenv("ZONOS2_FIXED_REFERENCE_FILE")
+        if reference_file:
+            await _load_configured_fixed_references(get_global_state(), Path(reference_file))
+        yield
+    finally:
+        if _GLOBAL_STATE is not None:
+            _GLOBAL_STATE.shutdown()
 
 
 app = FastAPI(title="Zonos2 API Server", version="0.0.1", lifespan=lifespan)
@@ -1743,6 +1773,26 @@ async def tts_generate(
         max_prompt_frames=state.config.max_seq_len - 1 if req.retain_continuation or track_audio else None,
         defer_audio_tail=req.defer_audio_tail,
     )
+    reference = select_fixed_reference(
+        state.fixed_references,
+        language=language,
+        speaker_id=req.speaker_embedding_id,
+        seed=req.seed,
+    )
+    if reference is not None and not req.retain_continuation and not track_audio:
+        msg = replace(
+            msg,
+            long_form_window_chunks=1,
+            long_form_pin_anchor=True,
+            max_prompt_frames=state.config.max_seq_len - 1,
+            continuation_context=TTSContinuationContext(
+                completed_chunks=1,
+                anchor_text=reference.text,
+                anchor_codes=[list(row) for row in reference.prompt_codes],
+                history_text=[],
+                history_codes=[],
+            ),
+        )
     return await _submit_tts_generation(state, msg, req, session_id)
 
 
@@ -1872,10 +1922,14 @@ async def tts_capabilities():
     state = get_global_state()
     speaking_rate_num_buckets = _model_speaking_rate_num_buckets(state.config)
     quality_num_buckets = _model_quality_num_buckets(state.config)
+    fixed_references: dict[str, dict[str, int]] = {}
+    for (language, speaker_id), reference in state.fixed_references.items():
+        fixed_references.setdefault(language, {})[speaker_id] = reference.seed
     return {
         "text_normalization_enabled": normalization_enabled(),
         "text_norm_languages": list(SERVER_TO_NEMO_LANG),
         "audio_tail_continuation": state.config.num_tokenizer == 0,
+        "fixed_references": fixed_references,
         "speaker_enabled": _model_supports_speaker(state.config),
         "speaker_embedding_dim": _model_speaker_dim(state.config),
         "n_codebooks": int(getattr(state.config.model_config, "n_codebooks", 9)),

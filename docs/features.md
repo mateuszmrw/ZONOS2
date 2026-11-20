@@ -35,6 +35,22 @@ With `long_form_pin_anchor` (default on), the whole first chunk is pinned into e
 
 `prefix_cfg_scale` applies classifier-free guidance relative to the acoustic prefix. Its unconditional twin drops the prefix and context text but keeps the speaker and emotion conditioning; `>1` tightens continuity across chunk joins while `<1`/negative loosens it. It has no effect on the first chunk. Each request uses at most one guidance twin: prefix guidance takes precedence over emotion guidance (`emotion_cfg_scale`), which takes precedence over speaker guidance (`cfg_scale`).
 
+### Saved speech references
+
+The Python server can load pre-generated speech prompts at startup. Set
+`ZONOS2_FIXED_REFERENCE_FILE` to a trusted, read-only JSON asset and
+`ZONOS2_MODEL_REVISION` to the exact model revision the asset was made for.
+Use `--num-tokenizer 0` and register the matching saved `.npy` voices with
+`--tts-default-voices-dir`. The server checks the asset against `params.json`
+and the saved speaker files. Start without the file setting to leave this off.
+
+`POST /tts/generate` uses a saved prompt only for a matching registered
+speaker, language, and explicit seed. Native requests still have no default
+seed. The prompt is model context, not part of the audio response. Requests
+using continuation or audio tails keep their existing behavior.
+`GET /tts/capabilities` lists loaded references by language, speaker ID, and
+seed without returning their text or audio tokens.
+
 ## Distributed Serving
 
 Tensor parallelism is available with `--tp-size n`. Rank 0 handles API-facing scheduler messages and broadcasts work to the remaining ranks.
