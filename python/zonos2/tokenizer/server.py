@@ -146,10 +146,6 @@ class _LongFormState:
         )
 
 
-# Extra frames trimmed off a non-final chunk to remove residual trailing silence.
-_LONGFORM_BOUNDARY_TRIM = 3
-
-
 def _unwrap_msg(
     msg: BaseTokenizerMsg | BatchTokenizerMsg | BatchTTSTokenizerMsg,
 ) -> List[BaseTokenizerMsg]:
@@ -221,13 +217,9 @@ def tokenize_worker(
     # In shared mode this worker sees both the prompt and every frame. Tracking
     # live UIDs lets it discard late frames without keeping cancellation tombstones.
     active_uids: set[int] = set()
-    # Frames held back from the vocoder while streaming a chunk so the EOA
-    # countdown / end-of-content frames are never decoded before we know the trim
-    # point. Must be >= (total - eos_frame) + boundary trim so streamed frames
-    # never exceed the eventual trimmed length (else the vocoder buffer would
-    # diverge from the next chunk's prefix at the join). total - eos_frame is at
-    # most (eos alignment shift < n_codebooks) + (EOA countdown = n_codebooks + 1).
-    stream_margin = 2 * n_codebooks + _LONGFORM_BOUNDARY_TRIM + 1
+    # Hold back the EOA countdown and the possible alignment shift so the
+    # vocoder never sees frames beyond the eventual end of content.
+    stream_margin = 2 * n_codebooks + 1
     trailing_silence_idx = None
     if quality_features is not None:
         for idx, feature in enumerate(quality_features):
@@ -435,7 +427,10 @@ def tokenize_worker(
                             retain_continuation=msg.retain_continuation,
                             max_prompt_frames=msg.max_prompt_frames,
                             defer_audio_tail=msg.defer_audio_tail,
-                            track_audio=msg.defer_audio_tail or msg.audio_tail is not None,
+                            track_audio=(
+                                msg.defer_audio_tail or msg.audio_tail is not None
+                                or (chunks is not None and len(chunks) > 1)
+                            ),
                             playback_sources=(
                                 msg.audio_tail.playback_sources if msg.audio_tail is not None else []
                             ),
@@ -572,15 +567,9 @@ def tokenize_worker(
                                 )
                         continue
 
-                    # Chunk finished: trim to content, feed the remainder.
+                    # Keep all pre-EOA frames. A fixed cut at a join can remove speech.
                     complete = msg.finish_reason == "complete" and msg.eos_frame is not None
-                    kept = trim_chunk_codes(
-                        state.raw,
-                        msg.eos_frame,
-                        drop_trailing_frames=(
-                            _LONGFORM_BOUNDARY_TRIM if complete and state.open_end else 0
-                        ),
-                    )
+                    kept = trim_chunk_codes(state.raw, msg.eos_frame)
                     usable = complete and bool(kept)
                     # Never synthesize the next chunk with a whole transcript for
                     # unfinished or empty audio. Flush this request's partial PCM.

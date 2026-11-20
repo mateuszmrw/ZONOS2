@@ -300,7 +300,7 @@ def test_worker_restores_anchor_and_recent_text_without_replaying_audio(monkeypa
     first_replies = worker.run(first)
     context = first_replies[-1].continuation_context
     assert context is not None
-    assert len(context.history_codes[0]) == 27  # EOS at 30, minus boundary trim.
+    assert len(context.history_codes[0]) == 30
 
     second = replace(first, uid=2, text="Second paragraph.", continuation_context=context)
     second_replies = worker.run(second)
@@ -319,7 +319,7 @@ def test_worker_restores_anchor_and_recent_text_without_replaying_audio(monkeypa
     assert torch.equal(worker.prompts[-1].input_ids, expected)
     for value, replies in zip((101, 102, 103), (first_replies, second_replies, third_replies)):
         pcm = np.frombuffer(b"".join(reply.audio_data for reply in replies), dtype=np.float32)
-        assert len(pcm) == 27 * 512
+        assert len(pcm) == 30 * 512
         np.testing.assert_allclose(pcm, value, rtol=0, atol=2e-5)
 
 
@@ -358,16 +358,62 @@ def test_worker_decodes_all_nine_codebooks_at_request_end(
         _template(), long_form=False, retain_continuation=retain,
         continuation_context=_context() if linked else None,
     ))
-    kept = eos - 3 if retain else eos
     assert replies[-1].finish_reason == "complete"
-    assert sum(len(reply.audio_data) for reply in replies) == kept * 512 * 4
+    assert sum(len(reply.audio_data) for reply in replies) == eos * 512 * 4
     context = replies[-1].continuation_context
     if retain:
         assert context is not None
-        assert context.history_codes == [raw[:kept]]
+        assert context.history_codes == [raw[:eos]]
     else:
         assert context is None
-    assert decoded == {tuple(row) for row in aligned[:kept]}
+    assert decoded == {tuple(row) for row in aligned}
+
+
+def test_worker_keeps_endings_at_internal_fixed_reference_joins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _WorkerHarness(monkeypatch)
+    width = 9
+    # The middle chunk is shorter than the codebook delay, so the decoder
+    # must carry the first chunk's ending across two joins.
+    segments = [
+        [[offset + frame * width + cb for cb in range(width)] for frame in range(length)]
+        for offset, length in ((21, 47), (501, 4), (533, 52))
+    ]
+
+    def send_frames(msg: TTSUserMsg) -> None:
+        aligned = segments[len(worker.prompts)]
+        worker.prompts.append(msg)
+        eos = len(aligned)
+        raw = [
+            [aligned[i - cb][cb] if 0 <= i - cb < eos else 1025 for cb in range(width)]
+            for i in range(eos + width)
+        ]
+        worker.pending.append(BatchTTSTokenizerMsg([
+            TTSDetokenizeMsg(
+                uid=msg.uid, audio_codes=row, finished=i == len(raw) - 1,
+                eos_frame=eos if i >= eos else None,
+                finish_reason="complete" if i == len(raw) - 1 else None,
+            )
+            for i, row in enumerate(raw)
+        ]))
+
+    monkeypatch.setattr(worker, "_backend", send_frames)
+    monkeypatch.setattr(
+        vocoder, "decode_dac",
+        lambda codes: codes.sum(dim=-1).float().repeat_interleave(512, dim=1).cpu(),
+    )
+    reference = replace(_context(), history_text=[], history_codes=[], anchor_source="voice")
+    replies = worker.run(replace(
+        _template(), text="First sentence. Next. Final sentence.",
+        long_form=True, long_form_chunk_chars=15, long_form_split_mode="sentence",
+        long_form_window_chunks=1, continuation_context=reference,
+    ))
+    assert replies[-1].finish_reason == "complete"
+    assert len(worker.prompts) == len(segments)
+    pcm = np.frombuffer(b"".join(r.audio_data for r in replies), dtype=np.float32)
+    expected = [sum(row) for segment in segments for row in segment]
+    np.testing.assert_allclose(pcm, np.repeat(expected, 512), rtol=0, atol=0.002)
 
 
 @pytest.mark.parametrize("link_short_chunk", [False, True])
@@ -399,7 +445,7 @@ def test_worker_preserves_playback_tokens_across_short_branch_seams(
             worker.pending.append(BatchTTSTokenizerMsg([
                 TTSDetokenizeMsg(
                     msg.uid, row, finished=k == len(rows) - 1,
-                    eos_frame=lengths[i] + (3 if defer else 0) if k == len(rows) - 1 else None,
+                    eos_frame=lengths[i] if k == len(rows) - 1 else None,
                     finish_reason="complete" if k == len(rows) - 1 else None,
                 )
                 for k, row in enumerate(rows)
@@ -474,8 +520,8 @@ def test_worker_checks_playback_against_the_prefix_actually_used(monkeypatch: py
     # "101" actually used in chunk 2's prompt: let chunk 2's rows complete its
     # ending. "102" not used in chunk 3's prompt: keep its original ending.
     expected = [
-        *([101 * 9] * 19), *(101 * i + 102 * (9 - i) for i in range(8, 0, -1)),
-        *([102 * 9] * 27), *([103 * 9] * 30),
+        *([101 * 9] * 22), *(101 * i + 102 * (9 - i) for i in range(8, 0, -1)),
+        *([102 * 9] * 30), *([103 * 9] * 30),
     ]
     np.testing.assert_allclose(audio, np.repeat(expected, 512), rtol=0, atol=0.001)
 
@@ -514,7 +560,7 @@ def test_matching_prefixes_keep_the_continuous_decoder_output(monkeypatch: pytes
         for prev, new in zip(whole_prompts, worker.prompts, strict=True)
     )
     continuous_pcm = b"".join(r.audio_data for r in whole)
-    assert len(continuous_pcm) == (27 * 2 + 30) * 512 * 4
+    assert len(continuous_pcm) == 3 * 30 * 512 * 4
     assert b"".join(r.audio_data for r in first + final) == continuous_pcm
 
 
@@ -674,7 +720,7 @@ def test_http_route_returns_custom_header_and_pcm(monkeypatch: pytest.MonkeyPatc
         )
         assert response.status_code == 200
         assert response.headers["content-type"] == "audio/pcm"
-        assert len(response.content) == 27 * 512 * 4
+        assert len(response.content) == 30 * 512 * 4
         last = client.post(
             "/tts/generate", headers={"X-TTS-Session-ID": "owner"},
             json={
@@ -746,9 +792,9 @@ def test_audio_track_order_is_separate_from_model_branches(
         combined = np.frombuffer(
             b"".join(part.content for part in (a, c, b, d, e, ending)), dtype=np.float32,
         )
-        assert combined.size == 5 * 27 * 512
+        assert combined.size == 5 * 30 * 512
         # The fake decoder is constant per phrase, so each must occupy its exact slot.
-        expected = np.repeat(np.arange(101, 106, dtype=np.float32), 27 * 512)
+        expected = np.repeat(np.arange(101, 106, dtype=np.float32), 30 * 512)
         np.testing.assert_allclose(combined, expected, rtol=0, atol=2e-5)
         assert len(worker.prompts) == 5
         assert not manager.active_workers
@@ -776,7 +822,7 @@ def test_failed_track_attempt_can_retry_the_same_audio_tail(monkeypatch: pytest.
         assert client.get(b.headers["X-TTS-Audio-Status-URL"], headers=headers).json() == {
             "finish_reason": "complete", "audio_tail_pending": False, "usable": False,
         }
-        assert len(a.content + b.content) == (27 + 30) * 512 * 4
+        assert len(a.content + b.content) == 2 * 30 * 512 * 4
 
 
 def test_http_rejects_retention_without_any_context(monkeypatch: pytest.MonkeyPatch) -> None:
