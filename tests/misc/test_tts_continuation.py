@@ -1089,9 +1089,9 @@ def test_stream_disconnect_cleans_request_and_preserves_parent(
         disconnected = asyncio.Event()
         wait_for_tts_start = state.wait_for_tts_start
 
-        async def observe_start(uid: int) -> None:
+        async def observe_start(uid: int, *, allow_incomplete: bool) -> None:
             waiting.set()
-            await wait_for_tts_start(uid)
+            await wait_for_tts_start(uid, allow_incomplete=allow_incomplete)
 
         with monkeypatch.context() as mp:
             mp.setattr(state.send_tokenizer, "put", submitted.put)
@@ -1275,6 +1275,75 @@ def test_retained_stream_failure_after_headers(monkeypatch: pytest.MonkeyPatch, 
         else:
             assert sent.empty()
         assert not state.active_workers and not state.ack_map
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("before_headers", "finish_reason"),
+    [
+        (True, "frame_limit"),
+        (False, "frame_limit"),
+        (False, "failed"),
+        (False, None),
+        (False, "complete"),
+    ],
+)
+def test_long_form_stream_without_status_requires_complete_finish(
+    monkeypatch: pytest.MonkeyPatch, before_headers: bool, finish_reason: TTSFinishReason | None
+) -> None:
+    async def scenario() -> None:
+        incoming: asyncio.Queue[TTSAudioReply] = asyncio.Queue()
+        state = _frontend(monkeypatch, _WorkerHarness(monkeypatch), incoming)
+        sent: asyncio.Queue[TTSTokenizeMsg | AbortMsg] = asyncio.Queue()
+        monkeypatch.setattr(state.send_tokenizer, "put", sent.put)
+        response = await api_server.tts_generate(
+            api_server.TTSGenerateRequest(
+                text="This sentence is part of a long-form reply. " * 6,
+                stream=True,
+                long_form=True,
+                long_form_split_mode="sentence",
+            ),
+        )
+        msg = sent.get_nowait()
+        assert isinstance(msg, TTSTokenizeMsg)
+        assert msg.long_form and msg.long_form_chunk_chars == 150
+        assert not msg.retain_continuation and not msg.defer_audio_tail
+        assert "X-TTS-Continuation-Status-URL" not in response.headers
+        assert "X-TTS-Audio-Status-URL" not in response.headers
+
+        pcm = b"\0" * 4
+        terminal = TTSAudioReply(msg.uid, b"", True, finish_reason=finish_reason)
+        await incoming.put(terminal if before_headers else TTSAudioReply(msg.uid, pcm, False))
+        received: list[Message] = []
+
+        async def send(event: Message) -> None:
+            received.append(event)
+            if not before_headers and event.get("more_body"):
+                await incoming.put(terminal)
+
+        async def receive() -> Message:
+            return await asyncio.Future[Message]()
+
+        exchange = asyncio.wait_for(response({"type": "http"}, receive, send), timeout=2)
+        if before_headers:
+            await exchange
+            assert received[0]["status"] == 502
+            assert dict(received[0]["headers"])[b"x-tts-generation-status"] == b"frame_limit"
+        else:
+            if finish_reason == "complete":
+                await exchange
+                assert received[-1]["more_body"] is False
+            else:
+                with pytest.raises(RuntimeError, match=finish_reason or "failed"):
+                    await exchange
+                assert len(received) == 2  # No normal end-of-body event.
+            assert received[0]["status"] == 200
+            assert received[1] == {"type": "http.response.body", "body": pcm, "more_body": True}
+
+        assert not state.active_workers and not state.ack_map
+        assert not state.event_map and not state.start_time_map
+        assert sent.empty()
 
     asyncio.run(scenario())
 

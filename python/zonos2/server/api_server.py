@@ -8,7 +8,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Coroutine, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1078,12 +1078,24 @@ class FrontendManager:
     def _worker_rejected(error: str) -> HTTPException:
         return HTTPException(400, error, headers={"X-TTS-Generation-Status": "failed"})
 
-    async def wait_for_tts_start(self, uid: int) -> None:
-        """Check the first reply before opening a continuation HTTP stream."""
+    @staticmethod
+    def _check_tts_finish(reason: TTSFinishReason | None) -> None:
+        if reason != "complete":
+            status = reason or "failed"
+            raise HTTPException(
+                502,
+                f"TTS generation did not complete ({status}).",
+                headers={"X-TTS-Generation-Status": status},
+            )
+
+    async def wait_for_tts_start(self, uid: int, *, allow_incomplete: bool) -> None:
+        """Reject worker failures already queued before opening the stream."""
         await self._wait_for_reply(uid, self.event_map[uid])
-        error = next((ack.error for ack in self.ack_map[uid] if ack.error), None)
-        if error:
-            raise self._worker_rejected(error)
+        for ack in self.ack_map[uid]:
+            if ack.error:
+                raise self._worker_rejected(ack.error)
+            if ack.finished and not allow_incomplete:
+                self._check_tts_finish(ack.finish_reason)
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
@@ -1133,8 +1145,10 @@ class FrontendManager:
         except Exception:
             logger.warning("Could not send cancellation to TTS worker for uid=%d", uid)
 
-    async def stream_tts_audio(self, uid: int, fade_out_ms: float = 0.0):
-        """Stream TTS audio chunks as raw PCM bytes.
+    async def stream_tts_audio(
+        self, uid: int, fade_out_ms: float = 0.0
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream raw PCM and raise if generation does not complete.
 
         When fade_out_ms > 0, the last fade_out_ms of audio is withheld until
         the stream finishes so a cosine fade-out can be applied to the tail.
@@ -1145,6 +1159,7 @@ class FrontendManager:
         chunk_count = 0
         fade_bytes = int(44100 * max(0.0, fade_out_ms) / 1000.0) * 4
         held = b""
+        finish_reason: TTSFinishReason | None = None
         async for ack in self.wait_for_ack(uid):
             if isinstance(ack, TTSAudioReply):
                 if ack.audio_data:
@@ -1164,9 +1179,11 @@ class FrontendManager:
                     else:
                         yield ack.audio_data
                 if ack.finished:
+                    finish_reason = ack.finish_reason
                     break
         if held:
             yield _apply_fade_out_pcm(held, fade_out_ms)
+        self._check_tts_finish(finish_reason)
         if t_start is not None:
             e2e_s = time.perf_counter() - t_start
             audio_s = total_audio_bytes / (44100 * 4)  # float32 @ 44.1kHz
@@ -1255,7 +1272,7 @@ class _TTSStreamingResponse(StreamingResponse):
             headers=headers,
         )
 
-    async def _stream_with_status(self):
+    async def _stream_with_status(self) -> AsyncIterator[bytes]:
         try:
             async for chunk in self._audio:
                 yield chunk
@@ -1268,7 +1285,7 @@ class _TTSStreamingResponse(StreamingResponse):
     async def stream_response(self, send: Send) -> None:
         # Convert a worker error before headers to an ordinary JSON error response.
         try:
-            await self._state.wait_for_tts_start(self._uid)
+            await self._state.wait_for_tts_start(self._uid, allow_incomplete=self._has_status)
         except HTTPException as exc:
             response = JSONResponse(
                 {"detail": exc.detail}, status_code=exc.status_code,
